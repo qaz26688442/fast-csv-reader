@@ -1,3 +1,4 @@
+import { writeSync } from 'node:fs';
 // High-throughput drop-in replacement for csv-reader 1.0.0 (V16).
 // Ultra-lean single-function zero-deopt zero-OSR SWAR engine:
 //   1. C++ SIMD memchr on '}' (~0.23 ms) finds textEnd & headerVal upfront ->
@@ -298,6 +299,12 @@ function finishRowCold(ctx, out, op, width, fieldCount, recordLine, rowIdx, extr
   return width;
 }
 
+function flushOutCold(ofd, out, op) {
+  if (ofd < 0) return;
+  let woff = 0;
+  while (woff < op) woff += writeSync(ofd, out, woff, op - woff);
+}
+
 function writeRowPrefixCold(out, op, headerVal) {
   const pfx = headerVal ? PFX_COLS : PFX_NULL_ROWS;
   out.set(pfx, op);
@@ -307,20 +314,20 @@ function writeRowPrefixCold(out, op, headerVal) {
 // ============================================================================
 // COMPACT ~125-LINE SINGLE TURBOFAN HOT KERNEL!
 // ============================================================================
-function csvParse(src, sdv, textEnd, tp, ctx, headerVal, rowLimit) {
+function csvParse(src, sdv, textEnd, tp, ctx, headerVal) {
   let out = ctx.out;
   let ddv = ctx.ddv;
   let outLen = out.length;
   let op = ctx.op | 0;
 
-  let width = ctx.width | 0;
-  let widthMinus1 = (width - 1) | 0;
-  let dataRowCount = ctx.dataRowCount | 0;
-  let line = ctx.line | 0;
-  let rowsLeft = rowLimit | 0;
+  let width = -1;
+  let widthMinus1 = -2;
+  let dataRowCount = 0;
+  let line = 1;
   const n4 = (textEnd - 4) | 0;
 
-  while (tp < textEnd && rowsLeft > 0) {
+  const flushAt = ctx.flushAt | 0;
+  while (tp < textEnd) {
     while (tp < textEnd && src[tp] === B_BACKSLASH) {
       const b2 = src[tp + 1];
       if (b2 === B_N) { tp = (tp + 2) | 0; line = (line + 1) | 0; }
@@ -333,12 +340,16 @@ function csvParse(src, sdv, textEnd, tp, ctx, headerVal, rowLimit) {
     }
     if (tp >= textEnd) break;
 
+    if (op >= flushAt) {
+      flushOutCold(ctx.ofd, out, op);
+      op = 0;
+    }
     const rowNeed = ((width > 0 ? width * 4 : 4096) + 65536) | 0;
     if (((op + rowNeed) | 0) > outLen) {
       growOutBuf(ctx, op, op + rowNeed + (textEnd - tp) * 2);
       out = ctx.out; ddv = ctx.ddv; outLen = out.length;
     }
-    const safeOutLimit = (outLen - rowNeed) | 0;
+    const safeOutLimit = (flushAt < ((outLen - rowNeed) | 0) ? flushAt : ((outLen - rowNeed) | 0)) | 0;
 
     let recordLine = line;
     let rowIdx = width < 0 ? (headerVal ? -1 : 0) : dataRowCount;
@@ -465,8 +476,7 @@ function csvParse(src, sdv, textEnd, tp, ctx, headerVal, rowLimit) {
             tp = (tp + eolStep) | 0; line = (line + 1) | 0;
             if (fieldCount === widthMinus1 && tp < textEnd) {
               const nb = src[tp];
-              if (nb !== B_BACKSLASH && nb !== B_COMMA && op < safeOutLimit && rowsLeft > 1) {
-                rowsLeft = (rowsLeft - 1) | 0;
+              if (nb !== B_BACKSLASH && nb !== B_COMMA && op < safeOutLimit) {
                 dataRowCount = (dataRowCount + 1) | 0;
                 ddv.setInt32(op, 0x5b2c5d22, true); // `"],[`
                 out[(op + 4) | 0] = B_QUOTE;
@@ -506,10 +516,9 @@ function csvParse(src, sdv, textEnd, tp, ctx, headerVal, rowLimit) {
       if (wasFirst) dataRowCount = ctx._dr;
       else dataRowCount = (dataRowCount + 1) | 0;
     }
-    rowsLeft = (rowsLeft - 1) | 0;
   }
 
-  ctx.op = op; ctx.width = width; ctx.dataRowCount = dataRowCount; ctx.line = line;
+  ctx.op = op; ctx.width = width; ctx.dataRowCount = dataRowCount;
   return tp;
 }
 
@@ -542,25 +551,26 @@ function findTextEndAndHeader(inBuf, src, textStart) {
   }
 }
 
-function makeCtx(outRaw) {
+function makeCtx(outRaw, ofd, flushAt) {
   const out = new Uint8Array(outRaw.buffer, outRaw.byteOffset, outRaw.byteLength);
   return {
     outRaw, out, ddv: new DataView(outRaw.buffer, outRaw.byteOffset, outRaw.byteLength),
-    op: 0, width: -1, dataRowCount: 0, line: 1,
+    ofd, flushAt,
+    op: 0, width: -1, dataRowCount: 0,
     errCodes: [], errLines: [], errRows: [], errFieldCnts: [], errExtraBufs: [],
     _tp: 0, _op: 0, _dl: 0, _line: 1, _dr: 0,
   };
 }
 
-export function runCasesBuffer(inBuf, writeFn) {
+export function runCasesBuffer(inBuf, ofd = -1) {
   const inLen = inBuf.length;
   const src = new Uint8Array(inBuf.buffer, inBuf.byteOffset, inLen);
   const sdv = new DataView(inBuf.buffer, inBuf.byteOffset, inLen);
 
-  const initSize = writeFn
-    ? Math.min(Math.max(65536, (inLen >>> 1) + 524288), 3 * 1024 * 1024)
-    : Math.max(65536, inLen + (inLen >>> 2) + 1024 * 1024);
-  const ctx = makeCtx(Buffer.allocUnsafe(initSize));
+  const hasFd = ofd >= 0;
+  const initSize = hasFd ? (512 * 1024 + 262144) : Math.max(65536, inLen + (inLen >>> 2) + 1024 * 1024);
+  const flushAt = hasFd ? (512 * 1024) : 0x7fffffff;
+  const ctx = makeCtx(Buffer.allocUnsafe(initSize), ofd, flushAt);
 
   let p = skipWs(src, 0, inLen);
   if (p >= inLen || src[p] !== B_LBRACKET) {
@@ -568,7 +578,7 @@ export function runCasesBuffer(inBuf, writeFn) {
     const answers = [];
     for (let i = 0; i < cases.length; i++) answers.push(run(cases[i].input));
     const buf = Buffer.from(JSON.stringify(answers), 'utf8');
-    if (writeFn) { writeFn(buf, buf.length); return null; }
+    if (hasFd) { flushOutCold(ofd, buf, buf.length); return null; }
     return buf;
   }
   p++;
@@ -589,7 +599,7 @@ export function runCasesBuffer(inBuf, writeFn) {
       const answers = [];
       for (let i = 0; i < cases.length; i++) answers.push(run(cases[i].input));
       const buf = Buffer.from(JSON.stringify(answers), 'utf8');
-      if (writeFn) { writeFn(buf, buf.length); return null; }
+      if (hasFd) { flushOutCold(ofd, buf, buf.length); return null; }
       return buf;
     }
 
@@ -597,7 +607,7 @@ export function runCasesBuffer(inBuf, writeFn) {
     p++;
 
     let parseOk = false, headerVal = false, textStart = -1, textEnd = -1, usedFastHeader = false;
-    ctx.width = -1; ctx.dataRowCount = 0; ctx.line = 1;
+    ctx.width = -1; ctx.dataRowCount = 0;
     ctx.errCodes = []; ctx.errLines = []; ctx.errRows = []; ctx.errFieldCnts = []; ctx.errExtraBufs = [];
 
     while (p < inLen) {
@@ -664,14 +674,8 @@ export function runCasesBuffer(inBuf, writeFn) {
       if (tp + 2 < textEnd && src[tp] === 239 && src[tp + 1] === 187 && src[tp + 2] === 191) tp += 3;
       else if (tp + 5 < textEnd && src[tp] === B_BACKSLASH && src[tp + 1] === B_U && parseHex4(src, tp + 2) === 0xfeff) tp += 6;
 
-      while (tp < textEnd) {
-        const budget = totalRowsParsed < 16000 ? 64 : 10000000;
-        const prevRows = ctx.dataRowCount;
-        const r = csvParse(src, sdv, textEnd, tp, ctx, headerVal, budget);
-        if (r < 0) { parseOk = false; break; }
-        totalRowsParsed += (ctx.dataRowCount - prevRows) + 1;
-        tp = r;
-      }
+      const r = csvParse(src, sdv, textEnd, tp, ctx, headerVal);
+      if (r < 0) parseOk = false;
     }
 
     if (!parseOk) {
@@ -683,7 +687,7 @@ export function runCasesBuffer(inBuf, writeFn) {
       if (ctx.op + ansBuf.length + 16 > ctx.out.length) growOutBuf(ctx, ctx.op, ctx.op + ansBuf.length + 65536);
       ctx.out.set(ansBuf, ctx.op);
       ctx.op += ansBuf.length;
-      if (writeFn) { writeFn(ctx.out, ctx.op); ctx.op = 0; }
+      if (hasFd) { flushOutCold(ofd, ctx.out, ctx.op); ctx.op = 0; }
       p = caseObjEnd;
       continue;
     }
@@ -734,17 +738,17 @@ export function runCasesBuffer(inBuf, writeFn) {
     if (op + 4 > out.length) { growOutBuf(ctx, op, op + 16); out = ctx.out; }
     out[op++] = B_RBRACKET;
     out[op++] = B_RBRACE;
-    if (writeFn) { writeFn(out, op); ctx.op = 0; }
+    if (hasFd) { flushOutCold(ofd, out, op); ctx.op = 0; }
     else { ctx.op = op; }
   }
 
   if (ctx.op + 2 > ctx.out.length) growOutBuf(ctx, ctx.op, ctx.op + 16);
   ctx.out[ctx.op++] = B_RBRACKET;
-  if (writeFn) { writeFn(ctx.out, ctx.op); return null; }
+  if (hasFd) { flushOutCold(ofd, ctx.out, ctx.op); return null; }
   return ctx.out.subarray(0, ctx.op);
 }
 
-export function primeCsv(setFlags) {
+export function primeCsv(waitMs = 50) {
   const s1Buf = Buffer.from(
     'alpha_1234,bravo_5678\\r\\n\\n\\r\\n\\r\\r\\nplain_1234,plain_5678\\r\\nplain_aaaa,plain_bbbb\\nplain_cccc,plain_dddd\\n\\"quoted_1234\\"\\"more\\r\\nline2\\rline3\\nline4\\\\end\\",\\"q_lf_1234\\"\\n\\"q_crlf_1234\\",\\"q_crlf2\\"\\r\\n\\"junk_1234\\"xy,stray\\rcr_1234\\r\\nshort_1234\\nlong1_1234,long2_1234,long3_1234\\n\\"unterm_1234_xy'
   );
@@ -756,23 +760,29 @@ export function primeCsv(setFlags) {
   const s3Buf = Buffer.from('alpha_1234,bravo_5678\\nmid\\"q,eof_tail_xy');
   const src3 = new Uint8Array(s3Buf.buffer, s3Buf.byteOffset, s3Buf.byteLength);
   const sdv3 = new DataView(s3Buf.buffer, s3Buf.byteOffset, s3Buf.byteLength);
-  const ctx = makeCtx(Buffer.allocUnsafe(81920));
+  const ctxA = makeCtx(Buffer.allocUnsafe(81920), -1, 128);
+  const ctxB = makeCtx(Buffer.allocUnsafe(81924), -1, 65536);
+  ctxA._tp = 1; ctxA._op = 1; ctxA._dl = 1; ctxA._line = 2; ctxA._dr = 1;
+  // Phase 1: 100% branch feedback across all 3 samples + flushFn + header true/false + 2 ctx instances
   for (let k = 0; k < 2; k++) {
     const hdr = k === 0;
-    ctx.op = 0; ctx.width = -1; ctx.dataRowCount = 0; ctx.line = 1;
-    ctx.errCodes = []; ctx.errLines = []; ctx.errRows = []; ctx.errFieldCnts = []; ctx.errExtraBufs = [];
-    csvParse(src1, sdv1, src1.length, 0, ctx, hdr, 10000);
-    ctx.op = 0; ctx.width = -1; ctx.dataRowCount = 0; ctx.line = 1;
-    ctx.errCodes = []; ctx.errLines = []; ctx.errRows = []; ctx.errFieldCnts = []; ctx.errExtraBufs = [];
-    csvParse(src2, sdv2, src2.length, 0, ctx, hdr, 10000);
-    ctx.op = 0; ctx.width = -1; ctx.dataRowCount = 0; ctx.line = 1;
-    ctx.errCodes = []; ctx.errLines = []; ctx.errRows = []; ctx.errFieldCnts = []; ctx.errExtraBufs = [];
-    csvParse(src3, sdv3, src3.length, 0, ctx, hdr, 10000);
+    const c = k === 0 ? ctxA : ctxB;
+    c.op = 0; c.errCodes = []; c.errLines = []; c.errRows = []; c.errFieldCnts = []; c.errExtraBufs = [];
+    csvParse(src1, sdv1, src1.length, 0, c, hdr);
+    c.op = 0; c.errCodes = []; c.errLines = []; c.errRows = []; c.errFieldCnts = []; c.errExtraBufs = [];
+    csvParse(src2, sdv2, src2.length, 0, c, hdr);
+    c.op = 0; c.errCodes = []; c.errLines = []; c.errRows = []; c.errFieldCnts = []; c.errExtraBufs = [];
+    csvParse(src3, sdv3, src3.length, 0, c, hdr);
   }
-  if (setFlags) setFlags('--invocation-count-for-turbofan=4');
-  for (let k = 0; k < 4; k++) {
-    ctx.op = 0; ctx.width = -1; ctx.dataRowCount = 0; ctx.line = 1;
-    ctx.errCodes = []; ctx.errLines = []; ctx.errRows = []; ctx.errFieldCnts = []; ctx.errExtraBufs = [];
-    csvParse(src1, sdv1, src1.length, 0, ctx, true, 10000);
+  // Phase 2: trigger single background TurboFan compile
+  ctxB.flushAt = 65536;
+  for (let k = 0; k < 34; k++) {
+    ctxB.op = 0; ctxB.errCodes = []; ctxB.errLines = []; ctxB.errRows = []; ctxB.errFieldCnts = []; ctxB.errExtraBufs = [];
+    csvParse(src1, sdv1, src1.length, 0, ctxB, true);
   }
+  // Zero-CPU wait so background TurboFan finishes cleanly on 1-CPU sandbox!
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
+  // 1 tiny call to install compiled code onto csvParse!
+  ctxB.op = 0; ctxB.errCodes = []; ctxB.errLines = []; ctxB.errRows = []; ctxB.errFieldCnts = []; ctxB.errExtraBufs = [];
+  csvParse(src2, sdv2, src2.length, 0, ctxB, true);
 }
