@@ -1,8 +1,7 @@
-// High-throughput drop-in replacement for csv-reader 1.0.0.
+// High-throughput drop-in replacement for csv-reader 1.0.0 (V7).
 // Exports:
 //   - run(input): exact slice-based string parser returning { columns, rows, errors }
 //   - runCasesBuffer(inBuf): zero-deopt single-pass SWAR UTF-8 Buffer CSV-in-JSON -> JSON-out engine
-//     that answers each case independently with automatic fallback to run() for exotic JSON escapes.
 
 const B_QUOTE = 34;      // "
 const B_COMMA = 44;      // ,
@@ -37,9 +36,6 @@ function parseHex4(buf, p) {
   return (va << 12) | (vb << 8) | (vc << 4) | vd;
 }
 
-/**
- * Exact drop-in replacement for csv-reader 1.0.0's readCsv(input).
- */
 export function run(input) {
   const text = String(input.text);
   const header = input.header === true;
@@ -48,7 +44,6 @@ export function run(input) {
   const rows = [];
   let columns = null;
   let width = -1;
-
   let pos = len > 0 && text.charCodeAt(0) === 0xfeff ? 1 : 0;
   let line = 1;
 
@@ -70,10 +65,8 @@ export function run(input) {
     do {
       quoted = pos < len && text.charCodeAt(pos) === 34;
       let val = '';
-
       if (!quoted) {
-        let start = pos;
-        let hasStray = false;
+        let start = pos, hasStray = false;
         ended = 2;
         while (pos < len) {
           const c = text.charCodeAt(pos);
@@ -92,13 +85,9 @@ export function run(input) {
         }
         if (ended === 2) val = hasStray ? val + text.slice(start, pos) : text.slice(start, pos);
       } else {
-        const open = pos;
-        const openLine = line;
+        const open = pos, openLine = line;
         pos += 1;
-        let start = pos;
-        let hasSpecial = false;
-        let closed = false;
-
+        let start = pos, hasSpecial = false, closed = false;
         while (pos < len) {
           const c = text.charCodeAt(pos);
           if (c === 34) {
@@ -118,14 +107,11 @@ export function run(input) {
           if (c === 10) line += 1;
           pos += 1;
         }
-
         if (!closed) {
-          pos = open + 1;
-          line = openLine;
+          pos = open + 1; line = openLine;
           errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
           val = '"';
-          let start2 = pos;
-          ended = 2;
+          let start2 = pos; ended = 2;
           while (pos < len) {
             const c = text.charCodeAt(pos);
             if (c === 44) { val += text.slice(start2, pos); pos += 1; ended = 0; break; }
@@ -147,9 +133,7 @@ export function run(input) {
           else if (nc === 10) { pos += 1; line += 1; ended = 1; }
           else if (nc === 13 && pos + 1 < len && text.charCodeAt(pos + 1) === 10) { pos += 2; line += 1; ended = 1; }
           else {
-            let start2 = pos;
-            let added = 0;
-            ended = 2;
+            let start2 = pos, added = 0; ended = 2;
             while (pos < len) {
               const c = text.charCodeAt(pos);
               if (c === 44) { const n = pos - start2; if (n > 0) { val += text.slice(start2, pos); added += n; } pos += 1; ended = 0; break; }
@@ -174,7 +158,6 @@ export function run(input) {
     } while (ended === 0);
 
     if (fields.length === 1 && fields[0].length === 0 && !quoted) continue;
-
     if (width < 0) width = fields.length;
     if (header && columns === null) { columns = fields; continue; }
     if (fields.length < width) {
@@ -185,12 +168,11 @@ export function run(input) {
     }
     rows.push(fields);
   }
-
   return { columns: header ? (columns ?? []) : null, rows, errors };
 }
 
 // ============================================================================
-// Zero-Deopt SWAR UTF-8 Buffer CSV-in-JSON -> JSON-out Engine
+// V7 Split-Hot-Loop Zero-Deopt SWAR Buffer Engine
 // ============================================================================
 
 const PFX_COLS = Buffer.from('{"columns":');
@@ -215,8 +197,7 @@ const STR_EXTRA = Buffer.from(',"extra":');
 const DIGIT_BUF = new Uint8Array(16);
 function writeUint(out, op, n) {
   if (n < 10) { out[op] = 48 + n; return op + 1; }
-  let len = 0;
-  let v = n;
+  let len = 0, v = n;
   while (v > 0) {
     const q = (v / 10) | 0;
     DIGIT_BUF[len++] = 48 + (v - q * 10);
@@ -235,9 +216,7 @@ function writeBytes(out, op, src) {
 function growOutBuf(ctx, op, needed) {
   let newLen = ctx.out.length * 2;
   while (newLen < needed) newLen *= 2;
-  const next = Buffer.allocUnsafe(newLen);
-  ctx.out.copy(next, 0, 0, op);
-  ctx.out = next;
+  const nextRaw = Buffer.allocUnsafe(newLen); const next = new Uint8Array(nextRaw.buffer, nextRaw.byteOffset, newLen); next.set(ctx.out.subarray(0, op)); ctx.out = next;
   ctx.ddv = new DataView(next.buffer, next.byteOffset, next.byteLength);
 }
 
@@ -294,7 +273,6 @@ function keyEquals(buf, start, end, str) {
   return true;
 }
 
-// Monomorphic error push helpers (separate numeric vs Buffer arrays -> ZERO elements-kind deopts!)
 function pushSimpleErr(ctx, code, line, rowIdx) {
   ctx.errCodes.push(code);
   ctx.errLines.push(line);
@@ -320,15 +298,10 @@ function pushLongErr(ctx, line, rowIdx, extraBuf) {
 }
 
 function scanUnquotedSlow(src, inLen, tp, out, op, recordLine, rowIdx, ctx) {
-  let dl = 0;
-  let ended = 0;
+  let dl = 0, ended = 0;
   while (tp < inLen) {
     const b = src[tp];
-    if (b !== B_COMMA && b !== B_BACKSLASH && b !== B_QUOTE) {
-      out[op++] = b;
-      tp++;
-      continue;
-    }
+    if (b !== B_COMMA && b !== B_BACKSLASH && b !== B_QUOTE) { out[op++] = b; tp++; continue; }
     if (b === B_COMMA) { tp++; ended = 0; break; }
     if (b === B_QUOTE) { ended = 2; break; }
     const b2 = src[tp + 1];
@@ -336,8 +309,7 @@ function scanUnquotedSlow(src, inLen, tp, out, op, recordLine, rowIdx, ctx) {
     if (b2 === B_R) {
       if (src[tp + 2] === B_BACKSLASH && src[tp + 3] === B_N) { tp += 4; dl = 1; ended = 1; break; }
       pushSimpleErr(ctx, ERR_STRAY_CR, recordLine, rowIdx);
-      tp += 2;
-      continue;
+      tp += 2; continue;
     }
     if (b2 === B_U) {
       const code = parseHex4(src, tp + 2);
@@ -345,23 +317,18 @@ function scanUnquotedSlow(src, inLen, tp, out, op, recordLine, rowIdx, ctx) {
       out[op] = B_BACKSLASH; out[op + 1] = B_U;
       out[op + 2] = src[tp + 2]; out[op + 3] = src[tp + 3];
       out[op + 4] = src[tp + 4]; out[op + 5] = src[tp + 5];
-      op += 6; tp += 6;
-      continue;
+      op += 6; tp += 6; continue;
     }
     out[op] = B_BACKSLASH; out[op + 1] = b2;
     op += 2; tp += 2;
   }
-  ctx._tp = tp;
-  ctx._op = op;
-  ctx._dl = dl;
+  ctx._tp = tp; ctx._op = op; ctx._dl = dl;
   return ended;
 }
 
 function finishQuotedCold(src, inLen, tp, out, op, openTp, openLine, openOp, line, closed, recordLine, rowIdx, ctx) {
   if (!closed) {
-    tp = openTp + 2;
-    line = openLine;
-    op = openOp;
+    tp = openTp + 2; line = openLine; op = openOp;
     pushSimpleErr(ctx, ERR_UNTERMINATED, recordLine, rowIdx);
     out[op] = B_QUOTE; out[op + 1] = B_BACKSLASH; out[op + 2] = B_QUOTE;
     op += 3;
@@ -374,12 +341,109 @@ function finishQuotedCold(src, inLen, tp, out, op, openTp, openLine, openOp, lin
   const opBeforeJunk = op;
   const r = scanUnquotedSlow(src, inLen, tp, out, op, recordLine, rowIdx, ctx);
   if (r < 0) return -1;
-  if (ctx._op > opBeforeJunk) {
-    pushSimpleErr(ctx, ERR_QUOTE_JUNK, recordLine, rowIdx);
-  }
+  if (ctx._op > opBeforeJunk) pushSimpleErr(ctx, ERR_QUOTE_JUNK, recordLine, rowIdx);
   out[ctx._op++] = B_QUOTE;
   ctx._line = line + ctx._dl;
   return r;
+}
+
+/**
+ * Separate compact SWAR quoted-field scanner (~60 lines -> compiles in ~2 ms).
+ */
+function scanQuotedField(src, sdv, inLen, n4, tp, out, ddv, op, line, recordLine, rowIdx, ctx) {
+  const openTp = tp;
+  const openLine = line;
+  const openOp = op;
+  out[op++] = B_QUOTE;
+  tp = (tp + 2) | 0;
+  let closed = false;
+
+  while (true) {
+    while (tp <= n4) {
+      const w = sdv.getInt32(tp, true);
+      ddv.setInt32(op, w, true);
+      const x2 = w ^ 0x5c5c5c5c;
+      const x3 = w ^ 0x22222222;
+      const m = ((((x2 - 0x01010101) | 0) & ~x2) | (((x3 - 0x01010101) | 0) & ~x3)) & SWAR_MASK;
+      if (m === 0) {
+        op = (op + 4) | 0;
+        tp = (tp + 4) | 0;
+      } else {
+        const k = (31 - Math.clz32(m & -m)) >>> 3;
+        op = (op + k) | 0;
+        tp = (tp + k) | 0;
+        break;
+      }
+    }
+    if (tp > n4) {
+      while (tp < inLen) {
+        const b = src[tp];
+        if (b === B_BACKSLASH || b === B_QUOTE) break;
+        out[op++] = b;
+        tp = (tp + 1) | 0;
+      }
+    }
+    if (src[tp] === B_QUOTE) break;
+    const b2 = src[tp + 1];
+    if (b2 === B_QUOTE) {
+      if (src[tp + 2] === B_BACKSLASH && src[tp + 3] === B_QUOTE) {
+        out[op] = B_BACKSLASH; out[op + 1] = B_QUOTE;
+        op = (op + 2) | 0; tp = (tp + 4) | 0;
+        continue;
+      }
+      tp = (tp + 2) | 0;
+      closed = true;
+      break;
+    }
+    if (b2 === B_R) {
+      out[op] = B_BACKSLASH; out[op + 1] = B_N;
+      op = (op + 2) | 0; line = (line + 1) | 0;
+      tp = (tp + (src[tp + 2] === B_BACKSLASH && src[tp + 3] === B_N ? 4 : 2)) | 0;
+      continue;
+    }
+    if (b2 === B_N) {
+      out[op] = B_BACKSLASH; out[op + 1] = B_N;
+      op = (op + 2) | 0; line = (line + 1) | 0; tp = (tp + 2) | 0;
+      continue;
+    }
+    if (b2 === B_U) {
+      const code = parseHex4(src, tp + 2);
+      if (code === 10 || code === 13 || code === 34) return -1;
+      out[op] = B_BACKSLASH; out[op + 1] = B_U;
+      out[op + 2] = src[tp + 2]; out[op + 3] = src[tp + 3];
+      out[op + 4] = src[tp + 4]; out[op + 5] = src[tp + 5];
+      op = (op + 6) | 0; tp = (tp + 6) | 0;
+      continue;
+    }
+    out[op] = B_BACKSLASH; out[op + 1] = b2;
+    op = (op + 2) | 0; tp = (tp + 2) | 0;
+  }
+
+  if (closed) {
+    const nb = src[tp];
+    if (nb === B_COMMA) {
+      out[op++] = B_QUOTE;
+      ctx._tp = (tp + 1) | 0; ctx._op = op; ctx._line = line;
+      return 0;
+    }
+    if (nb === B_BACKSLASH && src[tp + 1] === B_N) {
+      out[op++] = B_QUOTE;
+      ctx._tp = (tp + 2) | 0; ctx._op = op; ctx._line = (line + 1) | 0;
+      return 1;
+    }
+    if (nb === B_BACKSLASH && src[tp + 1] === B_R && src[tp + 2] === B_BACKSLASH && src[tp + 3] === B_N) {
+      out[op++] = B_QUOTE;
+      ctx._tp = (tp + 4) | 0; ctx._op = op; ctx._line = (line + 1) | 0;
+      return 1;
+    }
+    if (nb === B_QUOTE) {
+      out[op++] = B_QUOTE;
+      ctx._tp = tp; ctx._op = op; ctx._line = line;
+      return 2;
+    }
+    return finishQuotedCold(src, inLen, tp, out, op, openTp, openLine, openOp, line, true, recordLine, rowIdx, ctx);
+  }
+  return finishQuotedCold(src, inLen, tp, out, op, openTp, openLine, openOp, line, false, recordLine, rowIdx, ctx);
 }
 
 function finishRowCold(ctx, out, op, width, fieldCount, recordLine, rowIdx, rowStartOp, extraStartOp) {
@@ -392,7 +456,7 @@ function finishRowCold(ctx, out, op, width, fieldCount, recordLine, rowIdx, rowS
       growOutBuf(ctx, op, rowStartOp + ctx.reserve + 131072);
     }
     ctx._op = rowStartOp + ctx.reserve;
-    return fieldCount; // new width
+    return fieldCount;
   }
   if (fieldCount < width) {
     pushShortErr(ctx, recordLine, rowIdx, fieldCount);
@@ -412,8 +476,8 @@ function finishRowCold(ctx, out, op, width, fieldCount, recordLine, rowIdx, rowS
 }
 
 /**
- * Tight, compact, closure-free SWAR hot kernel for parsing one CSV "text" JSON string.
- * Designed for single fast TurboFan compilation with zero deopts.
+ * Ultra-compact SWAR unquoted + row-transition kernel (~100 lines -> fast TurboFan compile!).
+ * Flies across consecutive normal fields (`","`) AND consecutive normal rows (`"],["`) without leaving the loop!
  */
 function parseCaseText(src, sdv, inLen, tp, ctx) {
   let out = ctx.out;
@@ -422,6 +486,7 @@ function parseCaseText(src, sdv, inLen, tp, ctx) {
   let op = ctx.op;
 
   let width = -1;
+  let widthMinus1 = -2;
   let dataRowCount = 0;
   let line = 1;
   const n4 = (inLen - 4) | 0;
@@ -456,10 +521,11 @@ function parseCaseText(src, sdv, inLen, tp, ctx) {
       ddv = ctx.ddv;
       outLen = out.length;
     }
+    const safeOutLimit = (outLen - rowNeed) | 0;
 
-    const recordLine = line;
-    const rowIdx = width < 0 ? -1 : dataRowCount;
-    const rowStartOp = op;
+    let recordLine = line;
+    let rowIdx = width < 0 ? -1 : dataRowCount;
+    let rowStartOp = op;
 
     if (width >= 0 && dataRowCount > 0) out[op++] = B_COMMA;
     out[op++] = B_LBRACKET;
@@ -482,90 +548,9 @@ function parseCaseText(src, sdv, inLen, tp, ctx) {
       lastFieldStartOp = op;
       if (src[tp] === B_BACKSLASH && src[tp + 1] === B_QUOTE) {
         quoted = true;
-        const openTp = tp;
-        const openLine = line;
-        const openOp = op;
-        out[op++] = B_QUOTE;
-        tp = (tp + 2) | 0;
-        let closed = false;
-
-        while (true) {
-          while (tp <= n4) {
-            const w = sdv.getInt32(tp, true);
-            ddv.setInt32(op, w, true);
-            const x2 = w ^ 0x5c5c5c5c;
-            const x3 = w ^ 0x22222222;
-            const m = ((((x2 - 0x01010101) | 0) & ~x2) | (((x3 - 0x01010101) | 0) & ~x3)) & SWAR_MASK;
-            if (m === 0) {
-              op = (op + 4) | 0;
-              tp = (tp + 4) | 0;
-            } else {
-              const k = (31 - Math.clz32(m & -m)) >>> 3;
-              op = (op + k) | 0;
-              tp = (tp + k) | 0;
-              break;
-            }
-          }
-          if (tp > n4) {
-            while (tp < inLen) {
-              const b = src[tp];
-              if (b === B_BACKSLASH || b === B_QUOTE) break;
-              out[op++] = b;
-              tp = (tp + 1) | 0;
-            }
-          }
-          if (src[tp] === B_QUOTE) break;
-          const b2 = src[tp + 1];
-          if (b2 === B_QUOTE) {
-            if (src[tp + 2] === B_BACKSLASH && src[tp + 3] === B_QUOTE) {
-              out[op] = B_BACKSLASH; out[op + 1] = B_QUOTE;
-              op = (op + 2) | 0; tp = (tp + 4) | 0;
-              continue;
-            }
-            tp = (tp + 2) | 0;
-            closed = true;
-            break;
-          }
-          if (b2 === B_R) {
-            out[op] = B_BACKSLASH; out[op + 1] = B_N;
-            op = (op + 2) | 0; line = (line + 1) | 0;
-            tp = (tp + (src[tp + 2] === B_BACKSLASH && src[tp + 3] === B_N ? 4 : 2)) | 0;
-            continue;
-          }
-          if (b2 === B_N) {
-            out[op] = B_BACKSLASH; out[op + 1] = B_N;
-            op = (op + 2) | 0; line = (line + 1) | 0; tp = (tp + 2) | 0;
-            continue;
-          }
-          if (b2 === B_U) {
-            const code = parseHex4(src, tp + 2);
-            if (code === 10 || code === 13 || code === 34) return -1;
-            out[op] = B_BACKSLASH; out[op + 1] = B_U;
-            out[op + 2] = src[tp + 2]; out[op + 3] = src[tp + 3];
-            out[op + 4] = src[tp + 4]; out[op + 5] = src[tp + 5];
-            op = (op + 6) | 0; tp = (tp + 6) | 0;
-            continue;
-          }
-          out[op] = B_BACKSLASH; out[op + 1] = b2;
-          op = (op + 2) | 0; tp = (tp + 2) | 0;
-        }
-
-        if (closed) {
-          const nb = src[tp];
-          if (nb === B_COMMA) { out[op++] = B_QUOTE; tp = (tp + 1) | 0; ended = 0; }
-          else if (nb === B_BACKSLASH && src[tp + 1] === B_N) { out[op++] = B_QUOTE; tp = (tp + 2) | 0; line = (line + 1) | 0; ended = 1; }
-          else if (nb === B_BACKSLASH && src[tp + 1] === B_R && src[tp + 2] === B_BACKSLASH && src[tp + 3] === B_N) { out[op++] = B_QUOTE; tp = (tp + 4) | 0; line = (line + 1) | 0; ended = 1; }
-          else if (nb === B_QUOTE) { out[op++] = B_QUOTE; ended = 2; }
-          else {
-            const r = finishQuotedCold(src, inLen, tp, out, op, openTp, openLine, openOp, line, true, recordLine, rowIdx, ctx);
-            if (r < 0) return -1;
-            tp = ctx._tp; op = ctx._op; line = ctx._line; ended = r;
-          }
-        } else {
-          const r = finishQuotedCold(src, inLen, tp, out, op, openTp, openLine, openOp, line, false, recordLine, rowIdx, ctx);
-          if (r < 0) return -1;
-          tp = ctx._tp; op = ctx._op; line = ctx._line; ended = r;
-        }
+        const r = scanQuotedField(src, sdv, inLen, n4, tp, out, ddv, op, line, recordLine, rowIdx, ctx);
+        if (r < 0) return -1;
+        tp = ctx._tp; op = ctx._op; line = ctx._line; ended = r;
       } else {
         quoted = false;
         out[op++] = B_QUOTE;
@@ -606,7 +591,7 @@ function parseCaseText(src, sdv, inLen, tp, ctx) {
             tp = (tp + 1) | 0;
             const nf = (fieldCount + 1) | 0;
             if (nf < width && src[tp] !== B_BACKSLASH) {
-              ddv.setInt32(op, 0x00222c22, true);
+              ddv.setInt32(op, 0x00222c22, true); // `","`
               op = (op + 3) | 0;
               fieldCount = nf;
               continue;
@@ -616,10 +601,44 @@ function parseCaseText(src, sdv, inLen, tp, ctx) {
           }
           if (b === B_QUOTE) { ended = 2; break; }
           const b2 = src[tp + 1];
-          if (b2 === B_N) { tp = (tp + 2) | 0; line = (line + 1) | 0; ended = 1; break; }
+          if (b2 === B_N) {
+            tp = (tp + 2) | 0;
+            line = (line + 1) | 0;
+            if (fieldCount === widthMinus1) {
+              const nb = src[tp];
+              if (nb !== B_BACKSLASH && nb !== B_QUOTE && nb !== B_COMMA && op < safeOutLimit) {
+                dataRowCount = (dataRowCount + 1) | 0;
+                ddv.setInt32(op, 0x5b2c5d22, true); // `"],[`
+                out[(op + 4) | 0] = B_QUOTE;
+                op = (op + 5) | 0;
+                fieldCount = 0;
+                recordLine = line;
+                rowIdx = dataRowCount;
+                continue;
+              }
+            }
+            ended = 1;
+            break;
+          }
           if (b2 === B_R) {
             if (src[tp + 2] === B_BACKSLASH && src[tp + 3] === B_N) {
-              tp = (tp + 4) | 0; line = (line + 1) | 0; ended = 1; break;
+              tp = (tp + 4) | 0;
+              line = (line + 1) | 0;
+              if (fieldCount === widthMinus1) {
+                const nb = src[tp];
+                if (nb !== B_BACKSLASH && nb !== B_QUOTE && nb !== B_COMMA && op < safeOutLimit) {
+                  dataRowCount = (dataRowCount + 1) | 0;
+                  ddv.setInt32(op, 0x5b2c5d22, true); // `"],[`
+                  out[(op + 4) | 0] = B_QUOTE;
+                  op = (op + 5) | 0;
+                  fieldCount = 0;
+                  recordLine = line;
+                  rowIdx = dataRowCount;
+                  continue;
+                }
+              }
+              ended = 1;
+              break;
             }
             pushSimpleErr(ctx, ERR_STRAY_CR, recordLine, rowIdx);
             tp = (tp + 2) | 0;
@@ -654,6 +673,7 @@ function parseCaseText(src, sdv, inLen, tp, ctx) {
     } else {
       const wasFirst = width < 0;
       width = finishRowCold(ctx, out, op, width, fieldCount, recordLine, rowIdx, rowStartOp, extraStartOp);
+      widthMinus1 = (width - 1) | 0;
       out = ctx.out;
       ddv = ctx.ddv;
       outLen = out.length;
@@ -690,17 +710,13 @@ function makeCtx(out) {
   };
 }
 
-/**
- * Processes /input/cases.json UTF-8 Buffer into /output/answers.json UTF-8 Buffer in one streaming pass.
- * Each case is answered independently with zero cross-case state.
- */
 export function runCasesBuffer(inBuf) {
   const inLen = inBuf.length;
   const src = new Uint8Array(inBuf.buffer, inBuf.byteOffset, inLen);
   const sdv = new DataView(inBuf.buffer, inBuf.byteOffset, inLen);
 
-  const initSize = Math.max(65536, inLen + (inLen >>> 2) + 2 * 1024 * 1024);
-  let out = Buffer.allocUnsafe(initSize);
+  const initSize = Math.max(65536, inLen + (inLen >>> 2) + 1024 * 1024);
+  const outRaw = Buffer.allocUnsafe(initSize); let out = new Uint8Array(outRaw.buffer, outRaw.byteOffset, initSize);
   const ctx = makeCtx(out);
 
   let p = skipWs(src, 0, inLen);
@@ -714,7 +730,6 @@ export function runCasesBuffer(inBuf) {
   ctx.out[ctx.op++] = B_LBRACKET;
 
   let caseIdx = 0;
-
   while (true) {
     p = skipWs(src, p, inLen);
     if (p >= inLen || src[p] === B_RBRACKET) break;
@@ -735,21 +750,9 @@ export function runCasesBuffer(inBuf) {
     const caseOutStart = ctx.op;
     p++;
 
-    let inputFound = false;
-    let parseOk = true;
-    let headerVal = false;
-    let textFound = false;
-
-    ctx.width = -1;
-    ctx.dataRowCount = 0;
-    ctx.rec0Buf = null;
-    ctx.prefixStart = -1;
-    ctx.reserve = 0;
-    ctx.errCodes = [];
-    ctx.errLines = [];
-    ctx.errRows = [];
-    ctx.errFieldCnts = [];
-    ctx.errExtraBufs = [];
+    let inputFound = false, parseOk = true, headerVal = false, textFound = false;
+    ctx.width = -1; ctx.dataRowCount = 0; ctx.rec0Buf = null; ctx.prefixStart = -1; ctx.reserve = 0;
+    ctx.errCodes = []; ctx.errLines = []; ctx.errRows = []; ctx.errFieldCnts = []; ctx.errExtraBufs = [];
 
     while (p < inLen) {
       p = skipWs(src, p, inLen);
@@ -768,7 +771,6 @@ export function runCasesBuffer(inBuf) {
         inputFound = true;
         if (src[p] !== B_LBRACE) { parseOk = false; break; }
         p++;
-
         while (p < inLen) {
           p = skipWs(src, p, inLen);
           if (src[p] === B_RBRACE) { p++; break; }
@@ -815,7 +817,7 @@ export function runCasesBuffer(inBuf) {
       const ans = run(caseObj.input);
       const ansBuf = Buffer.from(JSON.stringify(ans), 'utf8');
       if (ctx.op + ansBuf.length + 16 > ctx.out.length) growOutBuf(ctx, ctx.op, ctx.op + ansBuf.length + 65536);
-      ansBuf.copy(ctx.out, ctx.op);
+      ctx.out.set(ansBuf, ctx.op);
       ctx.op += ansBuf.length;
       p = caseObjEnd;
       continue;
@@ -830,12 +832,12 @@ export function runCasesBuffer(inBuf) {
       let pp = ctx.prefixStart;
       if (headerVal) {
         pp = writeBytes(out, pp, PFX_COLS);
-        ctx.rec0Buf.copy(out, pp);
+        out.set(ctx.rec0Buf, pp);
         pp += ctx.rec0Buf.length;
         pp = writeBytes(out, pp, PFX_MID_ROWS);
       } else {
         pp = writeBytes(out, pp, PFX_NULL_ROWS);
-        ctx.rec0Buf.copy(out, pp);
+        out.set(ctx.rec0Buf, pp);
         pp += ctx.rec0Buf.length;
         if (ctx.dataRowCount > 0) out[pp++] = B_COMMA;
       }
@@ -846,11 +848,8 @@ export function runCasesBuffer(inBuf) {
       op = writeBytes(out, op, SFX_ERRORS);
     }
 
-    const errCodes = ctx.errCodes;
-    const errLines = ctx.errLines;
-    const errRows = ctx.errRows;
-    const errFieldCnts = ctx.errFieldCnts;
-    const errExtraBufs = ctx.errExtraBufs;
+    const errCodes = ctx.errCodes, errLines = ctx.errLines, errRows = ctx.errRows;
+    const errFieldCnts = ctx.errFieldCnts, errExtraBufs = ctx.errExtraBufs;
     const errCount = errCodes.length;
 
     for (let i = 0; i < errCount; i++) {
@@ -874,7 +873,7 @@ export function runCasesBuffer(inBuf) {
         op = writeUint(out, op, errFieldCnts[i]);
       } else if (code === ERR_LONG_ROW) {
         op = writeBytes(out, op, STR_EXTRA);
-        extraBuf.copy(out, op);
+        out.set(extraBuf, op);
         op += extraBuf.length;
       }
       out[op++] = B_RBRACE;
@@ -891,19 +890,17 @@ export function runCasesBuffer(inBuf) {
   return ctx.out.subarray(0, ctx.op);
 }
 
-// Populate type feedback across all parser branches once at module load using a tiny 260-byte constant sample.
-// Uses identical Uint8Array / Buffer / ctx maps as runCasesBuffer and keeps zero state between real cases.
 (function primeFeedback() {
   const s1Buf = Buffer.from(
-    '\uFEFFalpha_1234,bravo_5678\\r\\n\\n\\r\\n\\r\\r\\n\\"quoted_1234\\"\\"more\\r\\nline2\\rline3\\nline4\\\\end\\",\\"q_lf_1234\\"\\n\\"q_crlf_1234\\",\\"q_crlf2\\"\\r\\n\\"junk_1234\\"xy,stray\\rcr_1234\\r\\nshort_1234\\nlong1_1234,long2_1234,long3_1234\\nalpha_1234,bravo_5678,charlie_9\\n\\"unterm_1234"'
+    '\uFEFFalpha_1234,bravo_5678\\r\\n\\n\\r\\n\\r\\r\\nplain_1234,plain_5678\\r\\nplain_aaaa,plain_bbbb\\nplain_cccc,plain_dddd\\n\\"quoted_1234\\"\\"more\\r\\nline2\\rline3\\nline4\\\\end\\",\\"q_lf_1234\\"\\n\\"q_crlf_1234\\",\\"q_crlf2\\"\\r\\n\\"junk_1234\\"xy,stray\\rcr_1234\\r\\nshort_1234\\nlong1_1234,long2_1234,long3_1234\\n\\"unterm_1234"'
   );
   const src1 = new Uint8Array(s1Buf.buffer, s1Buf.byteOffset, s1Buf.byteLength);
   const sdv1 = new DataView(s1Buf.buffer, s1Buf.byteOffset, s1Buf.byteLength);
   const s2Buf = Buffer.from('alpha_1234,bravo_5678\\n\\"quoted_eof_1234\\",\\"quoted_eof2\\""');
   const src2 = new Uint8Array(s2Buf.buffer, s2Buf.byteOffset, s2Buf.byteLength);
   const sdv2 = new DataView(s2Buf.buffer, s2Buf.byteOffset, s2Buf.byteLength);
-  const ctx = makeCtx(Buffer.allocUnsafe(81920));
-  for (let k = 0; k < 40; k++) {
+  const pRaw = Buffer.allocUnsafe(81920); const ctx = makeCtx(new Uint8Array(pRaw.buffer, pRaw.byteOffset, 81920));
+  for (let k = 0; k < 10; k++) {
     ctx.op = 0; ctx.width = -1; ctx.dataRowCount = 0;
     ctx.errCodes = []; ctx.errLines = []; ctx.errRows = []; ctx.errFieldCnts = []; ctx.errExtraBufs = [];
     parseCaseText(src1, sdv1, src1.length, 0, ctx);
@@ -912,4 +909,3 @@ export function runCasesBuffer(inBuf) {
     parseCaseText(src2, sdv2, src2.length, 0, ctx);
   }
 })();
-
