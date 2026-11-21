@@ -1,12 +1,8 @@
-import { writeSync } from 'node:fs';
-// High-throughput drop-in replacement for csv-reader 1.0.0 (V16).
-// Ultra-lean single-function zero-deopt zero-OSR SWAR engine:
-//   1. C++ SIMD memchr on '}' (~0.23 ms) finds textEnd & headerVal upfront ->
-//      0x22-free SWAR (2-byte unquoted, 1-byte quoted) & zero rec0Buf/space-padding.
-//   2. Compact ~115-line `csvParse` (merged LF/CRLF row transition, cold \uXXXX & quote-junk
-//      extracted) -> compiles ONCE in ~3.5-4.5 ms with ZERO deopts and ZERO OSR!
-//   3. C++ `out.set` + `latin1Write` error serialization (~0.2 ms instead of 3.1 ms!).
-//   4. Per-case reusable 3 MB output buffer flushed directly via writeSync (5x fewer page faults).
+// High-throughput drop-in replacement for csv-reader 1.0.0 (V18).
+// Fixed-Closure Single-Buffer 3.25MB Streaming + 0x22-Free SWAR + Zero-Deopt Primed TurboFan.
+
+const fs = process.getBuiltinModule('node:fs');
+const { openSync, readSync, writeSync, closeSync } = fs;
 
 const B_QUOTE = 34;      // "
 const B_COMMA = 44;      // ,
@@ -26,6 +22,27 @@ const ERR_UNTERMINATED = 1;
 const ERR_QUOTE_JUNK = 2;
 const ERR_SHORT_ROW = 3;
 const ERR_LONG_ROW = 4;
+
+// ============================================================================
+// Fixed-Closure Single-ArrayBuffer Memory Layout (~3.5 MB total):
+//   [0 .. IN_CAP)               : 2.5 MB streaming input window (IN_BUF / IN_U8 / IN_DV)
+//   [IN_CAP .. IN_CAP+OUT_CAP)  : 1.0 MB L2/L3-hot output buffer (OUT_BUF / OUT_U8 / OUT_DV)
+// All const bindings -> TurboFan constant-folds backing pointers & lengths (zero x86-64 spills!)
+// ============================================================================
+const IN_CAP = 2621440;  // 2.5 MiB
+const OUT_CAP = 1048576; // 1.0 MiB
+const FLUSH_AT = 524288; // 512 KiB L2-hot flush threshold
+const SAFE_OUT = 960000; // Hard safety guard before 1 MiB end
+
+const MEM = new ArrayBuffer(IN_CAP + OUT_CAP);
+const IN_BUF = Buffer.from(MEM, 0, IN_CAP);
+const IN_U8 = new Uint8Array(MEM, 0, IN_CAP);
+const IN_DV = new DataView(MEM, 0, IN_CAP);
+const OUT_BUF = Buffer.from(MEM, IN_CAP, OUT_CAP);
+const OUT_U8 = new Uint8Array(MEM, IN_CAP, OUT_CAP);
+const OUT_DV = new DataView(MEM, IN_CAP, OUT_CAP);
+const ST = new Int32Array(8); // [op, width, dataRowCount, ofd, _tp, _op, _line, _dr]
+const WAIT_I32 = new Int32Array(new SharedArrayBuffer(4));
 
 const HEX_VAL = new Int8Array(128).fill(-1);
 for (let i = 48; i <= 57; i++) HEX_VAL[i] = i - 48;
@@ -152,17 +169,318 @@ const ERR_PFX_STR = [
   '{"code":"long_row","line":',
 ];
 
-function growOutBuf(ctx, op, needed) {
-  let newLen = ctx.out.length * 2;
-  while (newLen < needed) newLen *= 2;
-  const nextRaw = Buffer.allocUnsafe(newLen);
-  const next = new Uint8Array(nextRaw.buffer, nextRaw.byteOffset, newLen);
-  next.set(ctx.out.subarray(0, op));
-  ctx.outRaw = nextRaw;
-  ctx.out = next;
-  ctx.ddv = new DataView(next.buffer, next.byteOffset, next.byteLength);
+let errCodes = [], errLines = [], errRows = [], errFieldCnts = [], errExtraBufs = [];
+
+function resetErrors() {
+  errCodes = []; errLines = []; errRows = []; errFieldCnts = []; errExtraBufs = [];
 }
 
+function flushOutCold(op) {
+  const ofd = ST[3];
+  if (ofd < 0 || op <= 0) return;
+  let woff = 0;
+  while (woff < op) woff += writeSync(ofd, OUT_U8, woff, op - woff);
+}
+
+function writeRowPrefixCold(op, headerVal) {
+  const pfx = headerVal ? PFX_COLS : PFX_NULL_ROWS;
+  OUT_U8.set(pfx, op);
+  return op + pfx.length;
+}
+
+function pushSimpleErr(code, line, rowIdx) {
+  errCodes.push(code); errLines.push(line); errRows.push(rowIdx);
+  errFieldCnts.push(0); errExtraBufs.push(null);
+}
+
+function copyUnicodeCold(tp, op, checkComma) {
+  const code = parseHex4(IN_U8, tp + 2);
+  if (code === 10 || code === 13 || code === 34 || (checkComma && code === 44)) return -1;
+  OUT_U8[op] = B_BACKSLASH; OUT_U8[op + 1] = B_U;
+  OUT_U8[op + 2] = IN_U8[tp + 2]; OUT_U8[op + 3] = IN_U8[tp + 3];
+  OUT_U8[op + 4] = IN_U8[tp + 4]; OUT_U8[op + 5] = IN_U8[tp + 5];
+  return op + 6;
+}
+
+function scanUnquotedSlow(textEnd, tp, op, recordLine, rowIdx) {
+  let dl = 0, ended = 2;
+  while (tp < textEnd) {
+    if (op >= SAFE_OUT) return -2;
+    const b = IN_U8[tp];
+    if (b !== B_COMMA && b !== B_BACKSLASH) { OUT_U8[op++] = b; tp++; continue; }
+    if (b === B_COMMA) { tp++; ended = 0; break; }
+    const b2 = IN_U8[tp + 1];
+    if (b2 === B_N) { tp += 2; dl = 1; ended = 1; break; }
+    if (b2 === B_R) {
+      if (tp + 3 < textEnd && IN_U8[tp + 2] === B_BACKSLASH && IN_U8[tp + 3] === B_N) { tp += 4; dl = 1; ended = 1; break; }
+      pushSimpleErr(ERR_STRAY_CR, recordLine, rowIdx);
+      tp += 2; continue;
+    }
+    if (b2 === B_U) {
+      const nextOp = copyUnicodeCold(tp, op, true);
+      if (nextOp < 0) return -1;
+      op = nextOp; tp += 6; continue;
+    }
+    OUT_U8[op] = B_BACKSLASH; OUT_U8[op + 1] = b2;
+    op += 2; tp += 2;
+  }
+  ST[4] = tp; ST[5] = op; ST[6] = dl;
+  return ended;
+}
+
+function finishQuotedCold(textEnd, tp, op, openTp, openLine, openOp, line, closed, recordLine, rowIdx) {
+  if (!closed) {
+    tp = openTp + 2; line = openLine; op = openOp;
+    pushSimpleErr(ERR_UNTERMINATED, recordLine, rowIdx);
+    OUT_U8[op] = B_QUOTE; OUT_U8[op + 1] = B_BACKSLASH; OUT_U8[op + 2] = B_QUOTE;
+    op += 3;
+    const r = scanUnquotedSlow(textEnd, tp, op, recordLine, rowIdx);
+    if (r < 0) return r;
+    OUT_U8[ST[5]++] = B_QUOTE;
+    ST[6] = line + ST[6];
+    return r;
+  }
+  const opBeforeJunk = op;
+  const r = scanUnquotedSlow(textEnd, tp, op, recordLine, rowIdx);
+  if (r < 0) return r;
+  if (ST[5] > opBeforeJunk) pushSimpleErr(ERR_QUOTE_JUNK, recordLine, rowIdx);
+  OUT_U8[ST[5]++] = B_QUOTE;
+  ST[6] = line + ST[6];
+  return r;
+}
+
+function finishRowCold(op, width, fieldCount, recordLine, rowIdx, extraStartOp, headerVal) {
+  if (width < 0) {
+    OUT_U8[op++] = B_RBRACKET;
+    if (headerVal) { OUT_U8.set(PFX_MID_ROWS, op); op += PFX_MID_ROWS.length; ST[7] = 0; }
+    else { ST[7] = 1; }
+    ST[5] = op;
+    return fieldCount;
+  }
+  if (fieldCount < width) {
+    errCodes.push(ERR_SHORT_ROW); errLines.push(recordLine); errRows.push(rowIdx);
+    errFieldCnts.push(fieldCount); errExtraBufs.push(null);
+    for (let k = fieldCount; k < width; k++) {
+      OUT_U8[op] = B_COMMA; OUT_U8[op + 1] = B_QUOTE; OUT_U8[op + 2] = B_QUOTE;
+      op += 3;
+    }
+    OUT_U8[op++] = B_RBRACKET;
+  } else {
+    OUT_U8[op++] = B_RBRACKET;
+    errCodes.push(ERR_LONG_ROW); errLines.push(recordLine); errRows.push(rowIdx);
+    errFieldCnts.push(0); errExtraBufs.push(Buffer.from(OUT_U8.subarray(extraStartOp, op)));
+    op = extraStartOp;
+  }
+  ST[5] = op;
+  return width;
+}
+
+// ============================================================================
+// SINGLE TURBOFAN HOT KERNEL WITH FIXED-CLOSURE BUFFERS (ZERO POINTER SPILLS!)
+// Takes ONLY 3 scalar arguments (tp, textEnd, headerVal)!
+// ============================================================================
+function csvParse(tp, textEnd, headerVal) {
+  const inU8 = IN_U8, inDv = IN_DV, outU8 = OUT_U8, outDv = OUT_DV;
+  let op = ST[0] | 0;
+  let width = -1;
+  let widthMinus1 = -2;
+  let dataRowCount = 0;
+  let line = 1;
+  const n4 = (textEnd - 4) | 0;
+
+  while (tp < textEnd) {
+    while (tp < textEnd && inU8[tp] === 92) {
+      const b2 = inU8[tp + 1];
+      if (b2 === 110) { tp = (tp + 2) | 0; line = (line + 1) | 0; }
+      else if (b2 === 114 && tp + 3 < textEnd && inU8[tp + 2] === 92 && inU8[tp + 3] === 110) { tp = (tp + 4) | 0; line = (line + 1) | 0; }
+      else if (b2 === 117) {
+        const code = parseHex4(inU8, tp + 2);
+        if (code === 10 || code === 13 || code === 34 || code === 44) return -1;
+        break;
+      } else break;
+    }
+    if (tp >= textEnd) break;
+
+    if (op >= 524288) {
+      flushOutCold(op);
+      op = 0;
+    }
+
+    let recordLine = line;
+    let rowIdx = width < 0 ? (headerVal ? -1 : 0) : dataRowCount;
+    let rowStartOp = op;
+
+    if (width < 0) op = writeRowPrefixCold(op, headerVal) | 0;
+    else if (dataRowCount > 0) outU8[op++] = 44;
+    outU8[op++] = 91;
+
+    let fieldCount = 0, quoted = false, ended = 0, lastFieldStartOp = 0, extraStartOp = -1;
+
+    do {
+      if (op >= 960000) return -2;
+      if (fieldCount === width) { outU8[op++] = 93; extraStartOp = op; outU8[op++] = 91; }
+      else if (fieldCount > 0) outU8[op++] = 44;
+
+      lastFieldStartOp = op;
+      if (tp + 1 < textEnd && inU8[tp] === 92 && inU8[tp + 1] === 34) {
+        quoted = true;
+        const openTp = tp, openLine = line, openOp = op;
+        outU8[op++] = 34;
+        tp = (tp + 2) | 0;
+        let closed = false;
+
+        while (true) {
+          while (tp <= n4) {
+            const w = inDv.getInt32(tp, true);
+            outDv.setInt32(op, w, true);
+            const x = w ^ 0x5c5c5c5c;
+            const m = (((x - 0x01010101) | 0) & ~x) & -2139062144;
+            if (m === 0) { op = (op + 4) | 0; tp = (tp + 4) | 0; }
+            else {
+              const k = (31 - Math.clz32(m & -m)) >>> 3;
+              op = (op + k) | 0; tp = (tp + k) | 0;
+              break;
+            }
+          }
+          if (tp > n4) {
+            while (tp < textEnd && inU8[tp] !== 92) { outU8[op++] = inU8[tp]; tp = (tp + 1) | 0; }
+          }
+          if (tp >= textEnd) break;
+          const b2 = inU8[tp + 1];
+          if (b2 === 34) {
+            if (tp + 3 < textEnd && inU8[tp + 2] === 92 && inU8[tp + 3] === 34) {
+              outU8[op] = 92; outU8[op + 1] = 34; op = (op + 2) | 0; tp = (tp + 4) | 0;
+              continue;
+            }
+            tp = (tp + 2) | 0; closed = true; break;
+          }
+          if (b2 === 110 || b2 === 114) {
+            outU8[op] = 92; outU8[op + 1] = 110; op = (op + 2) | 0; line = (line + 1) | 0;
+            tp = (tp + (b2 === 114 && tp + 3 < textEnd && inU8[tp + 2] === 92 && inU8[tp + 3] === 110 ? 4 : 2)) | 0;
+            continue;
+          }
+          if (b2 === 117) {
+            const nop = copyUnicodeCold(tp, op, false) | 0;
+            if (nop < 0) return -1;
+            op = nop; tp = (tp + 6) | 0; continue;
+          }
+          outU8[op] = 92; outU8[op + 1] = b2; op = (op + 2) | 0; tp = (tp + 2) | 0;
+        }
+
+        let needCold = !closed;
+        if (closed) {
+          if (tp >= textEnd) { outU8[op++] = 34; ended = 2; }
+          else {
+            const nb = inU8[tp];
+            if (nb === 44) { outU8[op++] = 34; tp = (tp + 1) | 0; ended = 0; }
+            else if (nb === 92 && inU8[tp + 1] === 110) { outU8[op++] = 34; tp = (tp + 2) | 0; line = (line + 1) | 0; ended = 1; }
+            else if (nb === 92 && inU8[tp + 1] === 114 && tp + 3 < textEnd && inU8[tp + 2] === 92 && inU8[tp + 3] === 110) {
+              outU8[op++] = 34; tp = (tp + 4) | 0; line = (line + 1) | 0; ended = 1;
+            } else needCold = true;
+          }
+        }
+        if (needCold) {
+          const r = finishQuotedCold(textEnd, tp, op, openTp, openLine, openOp, line, closed, recordLine, rowIdx) | 0;
+          if (r < 0) return r;
+          tp = ST[4]; op = ST[5]; line = ST[6]; ended = r;
+        }
+      } else {
+        quoted = false;
+        outU8[op++] = 34;
+
+        while (true) {
+          while (tp <= n4) {
+            const w = inDv.getInt32(tp, true);
+            outDv.setInt32(op, w, true);
+            const x1 = w ^ 0x2c2c2c2c;
+            const x2 = w ^ 0x5c5c5c5c;
+            const m = ((((x1 - 0x01010101) | 0) & ~x1) | (((x2 - 0x01010101) | 0) & ~x2)) & -2139062144;
+            if (m === 0) { op = (op + 4) | 0; tp = (tp + 4) | 0; }
+            else {
+              const k = (31 - Math.clz32(m & -m)) >>> 3;
+              op = (op + k) | 0; tp = (tp + k) | 0;
+              break;
+            }
+          }
+          if (tp > n4) {
+            while (tp < textEnd) {
+              const b = inU8[tp];
+              if (b === 44 || b === 92) break;
+              outU8[op++] = b; tp = (tp + 1) | 0;
+            }
+          }
+          if (tp >= textEnd) { ended = 2; break; }
+
+          if (inU8[tp] === 44) {
+            tp = (tp + 1) | 0;
+            const nf = (fieldCount + 1) | 0;
+            if (nf < width && tp < textEnd && inU8[tp] !== 92) {
+              outDv.setInt32(op, 0x00222c22, true); // `","`
+              op = (op + 3) | 0; fieldCount = nf;
+              continue;
+            }
+            ended = 0; break;
+          }
+          const b2 = inU8[tp + 1];
+          let eolStep = 0;
+          if (b2 === 110) eolStep = 2;
+          else if (b2 === 114) {
+            if (tp + 3 < textEnd && inU8[tp + 2] === 92 && inU8[tp + 3] === 110) eolStep = 4;
+            else { pushSimpleErr(0, recordLine, rowIdx); tp = (tp + 2) | 0; continue; }
+          }
+          if (eolStep > 0) {
+            tp = (tp + eolStep) | 0; line = (line + 1) | 0;
+            if (fieldCount === widthMinus1 && tp < textEnd) {
+              const nb = inU8[tp];
+              if (nb !== 92 && nb !== 44 && op < 524288) {
+                dataRowCount = (dataRowCount + 1) | 0;
+                outDv.setInt32(op, 0x5b2c5d22, true); // `"],[`
+                outU8[(op + 4) | 0] = 34;
+                op = (op + 5) | 0;
+                fieldCount = 0; recordLine = line; rowIdx = dataRowCount;
+                continue;
+              }
+            }
+            ended = 1; break;
+          }
+          if (b2 === 117) {
+            const nop = copyUnicodeCold(tp, op, true) | 0;
+            if (nop < 0) return -1;
+            op = nop; tp = (tp + 6) | 0; continue;
+          }
+          outU8[op] = 92; outU8[op + 1] = b2; op = (op + 2) | 0; tp = (tp + 2) | 0;
+        }
+        outU8[op++] = 34;
+      }
+
+      fieldCount = (fieldCount + 1) | 0;
+    } while (ended === 0);
+
+    if (fieldCount === 1 && !quoted && op === ((lastFieldStartOp + 2) | 0)) {
+      op = rowStartOp;
+      continue;
+    }
+
+    if (fieldCount === width) {
+      outU8[op++] = 93;
+      dataRowCount = (dataRowCount + 1) | 0;
+    } else {
+      const wasFirst = width < 0;
+      width = finishRowCold(op, width, fieldCount, recordLine, rowIdx, extraStartOp, headerVal) | 0;
+      widthMinus1 = (width - 1) | 0;
+      op = ST[5];
+      if (wasFirst) dataRowCount = ST[7];
+      else dataRowCount = (dataRowCount + 1) | 0;
+    }
+  }
+
+  ST[0] = op; ST[1] = width; ST[2] = dataRowCount;
+  return tp;
+}
+
+// ============================================================================
+// Streaming File-to-File Driver (only 3.5 MB total memory touched across 23 MB I/O!)
+// ============================================================================
 function skipWs(buf, p, len) {
   while (p < len) {
     const b = buf[p];
@@ -213,576 +531,258 @@ function keyEquals(buf, start, end, str) {
   return true;
 }
 
-function pushSimpleErr(ctx, code, line, rowIdx) {
-  ctx.errCodes.push(code); ctx.errLines.push(line); ctx.errRows.push(rowIdx);
-  ctx.errFieldCnts.push(0); ctx.errExtraBufs.push(null);
-}
-
-function copyUnicodeCold(src, tp, out, op, checkComma) {
-  const code = parseHex4(src, tp + 2);
-  if (code === 10 || code === 13 || code === 34 || (checkComma && code === 44)) return -1;
-  out[op] = B_BACKSLASH; out[op + 1] = B_U;
-  out[op + 2] = src[tp + 2]; out[op + 3] = src[tp + 3];
-  out[op + 4] = src[tp + 4]; out[op + 5] = src[tp + 5];
-  return op + 6;
-}
-
-function scanUnquotedSlow(src, textEnd, tp, out, op, recordLine, rowIdx, ctx) {
-  let dl = 0, ended = 2;
-  while (tp < textEnd) {
-    const b = src[tp];
-    if (b !== B_COMMA && b !== B_BACKSLASH) { out[op++] = b; tp++; continue; }
-    if (b === B_COMMA) { tp++; ended = 0; break; }
-    const b2 = src[tp + 1];
-    if (b2 === B_N) { tp += 2; dl = 1; ended = 1; break; }
-    if (b2 === B_R) {
-      if (tp + 3 < textEnd && src[tp + 2] === B_BACKSLASH && src[tp + 3] === B_N) { tp += 4; dl = 1; ended = 1; break; }
-      pushSimpleErr(ctx, ERR_STRAY_CR, recordLine, rowIdx);
-      tp += 2; continue;
-    }
-    if (b2 === B_U) {
-      const nextOp = copyUnicodeCold(src, tp, out, op, true);
-      if (nextOp < 0) return -1;
-      op = nextOp; tp += 6; continue;
-    }
-    out[op] = B_BACKSLASH; out[op + 1] = b2;
-    op += 2; tp += 2;
-  }
-  ctx._tp = tp; ctx._op = op; ctx._dl = dl;
-  return ended;
-}
-
-function finishQuotedCold(src, textEnd, tp, out, op, openTp, openLine, openOp, line, closed, recordLine, rowIdx, ctx) {
-  if (!closed) {
-    tp = openTp + 2; line = openLine; op = openOp;
-    pushSimpleErr(ctx, ERR_UNTERMINATED, recordLine, rowIdx);
-    out[op] = B_QUOTE; out[op + 1] = B_BACKSLASH; out[op + 2] = B_QUOTE;
-    op += 3;
-    const r = scanUnquotedSlow(src, textEnd, tp, out, op, recordLine, rowIdx, ctx);
-    if (r < 0) return -1;
-    out[ctx._op++] = B_QUOTE;
-    ctx._line = line + ctx._dl;
-    return r;
-  }
-  const opBeforeJunk = op;
-  const r = scanUnquotedSlow(src, textEnd, tp, out, op, recordLine, rowIdx, ctx);
-  if (r < 0) return -1;
-  if (ctx._op > opBeforeJunk) pushSimpleErr(ctx, ERR_QUOTE_JUNK, recordLine, rowIdx);
-  out[ctx._op++] = B_QUOTE;
-  ctx._line = line + ctx._dl;
-  return r;
-}
-
-function finishRowCold(ctx, out, op, width, fieldCount, recordLine, rowIdx, extraStartOp, headerVal) {
-  if (width < 0) {
-    out[op++] = B_RBRACKET;
-    if (headerVal) { out.set(PFX_MID_ROWS, op); op += PFX_MID_ROWS.length; ctx._dr = 0; }
-    else { ctx._dr = 1; }
-    ctx._op = op;
-    return fieldCount;
-  }
-  if (fieldCount < width) {
-    ctx.errCodes.push(ERR_SHORT_ROW); ctx.errLines.push(recordLine); ctx.errRows.push(rowIdx);
-    ctx.errFieldCnts.push(fieldCount); ctx.errExtraBufs.push(null);
-    for (let k = fieldCount; k < width; k++) {
-      out[op] = B_COMMA; out[op + 1] = B_QUOTE; out[op + 2] = B_QUOTE;
-      op += 3;
-    }
-    out[op++] = B_RBRACKET;
-  } else {
-    out[op++] = B_RBRACKET;
-    ctx.errCodes.push(ERR_LONG_ROW); ctx.errLines.push(recordLine); ctx.errRows.push(rowIdx);
-    ctx.errFieldCnts.push(0); ctx.errExtraBufs.push(Buffer.from(out.subarray(extraStartOp, op)));
-    op = extraStartOp;
-  }
-  ctx._op = op;
-  return width;
-}
-
-function flushOutCold(ofd, out, op) {
-  if (ofd < 0) return;
-  let woff = 0;
-  while (woff < op) woff += writeSync(ofd, out, woff, op - woff);
-}
-
-function writeRowPrefixCold(out, op, headerVal) {
-  const pfx = headerVal ? PFX_COLS : PFX_NULL_ROWS;
-  out.set(pfx, op);
-  return op + pfx.length;
-}
-
-// ============================================================================
-// COMPACT ~125-LINE SINGLE TURBOFAN HOT KERNEL!
-// ============================================================================
-function csvParse(src, sdv, textEnd, tp, ctx, headerVal) {
-  let out = ctx.out;
-  let ddv = ctx.ddv;
-  let outLen = out.length;
-  let op = ctx.op | 0;
-
-  let width = -1;
-  let widthMinus1 = -2;
-  let dataRowCount = 0;
-  let line = 1;
-  const n4 = (textEnd - 4) | 0;
-
-  const flushAt = ctx.flushAt | 0;
-  while (tp < textEnd) {
-    while (tp < textEnd && src[tp] === B_BACKSLASH) {
-      const b2 = src[tp + 1];
-      if (b2 === B_N) { tp = (tp + 2) | 0; line = (line + 1) | 0; }
-      else if (b2 === B_R && tp + 3 < textEnd && src[tp + 2] === B_BACKSLASH && src[tp + 3] === B_N) { tp = (tp + 4) | 0; line = (line + 1) | 0; }
-      else if (b2 === B_U) {
-        const code = parseHex4(src, tp + 2);
-        if (code === 10 || code === 13 || code === 34 || code === 44) return -1;
-        break;
-      } else break;
-    }
-    if (tp >= textEnd) break;
-
-    if (op >= flushAt) {
-      flushOutCold(ctx.ofd, out, op);
-      op = 0;
-    }
-    const rowNeed = ((width > 0 ? width * 4 : 4096) + 65536) | 0;
-    if (((op + rowNeed) | 0) > outLen) {
-      growOutBuf(ctx, op, op + rowNeed + (textEnd - tp) * 2);
-      out = ctx.out; ddv = ctx.ddv; outLen = out.length;
-    }
-    const safeOutLimit = (flushAt < ((outLen - rowNeed) | 0) ? flushAt : ((outLen - rowNeed) | 0)) | 0;
-
-    let recordLine = line;
-    let rowIdx = width < 0 ? (headerVal ? -1 : 0) : dataRowCount;
-    let rowStartOp = op;
-
-    if (width < 0) op = writeRowPrefixCold(out, op, headerVal) | 0;
-    else if (dataRowCount > 0) out[op++] = B_COMMA;
-    out[op++] = B_LBRACKET;
-
-    let fieldCount = 0, quoted = false, ended = 0, lastFieldStartOp = 0, extraStartOp = -1;
-
-    do {
-      if (fieldCount === width) { out[op++] = B_RBRACKET; extraStartOp = op; out[op++] = B_LBRACKET; }
-      else if (fieldCount > 0) out[op++] = B_COMMA;
-
-      lastFieldStartOp = op;
-      if (tp + 1 < textEnd && src[tp] === B_BACKSLASH && src[tp + 1] === B_QUOTE) {
-        quoted = true;
-        const openTp = tp, openLine = line, openOp = op;
-        out[op++] = B_QUOTE;
-        tp = (tp + 2) | 0;
-        let closed = false;
-
-        while (true) {
-          while (tp <= n4) {
-            const w = sdv.getInt32(tp, true);
-            ddv.setInt32(op, w, true);
-            const x = w ^ 0x5c5c5c5c;
-            const m = (((x - 0x01010101) | 0) & ~x) & SWAR_MASK;
-            if (m === 0) { op = (op + 4) | 0; tp = (tp + 4) | 0; }
-            else {
-              const k = (31 - Math.clz32(m & -m)) >>> 3;
-              op = (op + k) | 0; tp = (tp + k) | 0;
-              break;
-            }
-          }
-          if (tp > n4) {
-            while (tp < textEnd && src[tp] !== B_BACKSLASH) { out[op++] = src[tp]; tp = (tp + 1) | 0; }
-          }
-          if (tp >= textEnd) break;
-          const b2 = src[tp + 1];
-          if (b2 === B_QUOTE) {
-            if (tp + 3 < textEnd && src[tp + 2] === B_BACKSLASH && src[tp + 3] === B_QUOTE) {
-              out[op] = B_BACKSLASH; out[op + 1] = B_QUOTE; op = (op + 2) | 0; tp = (tp + 4) | 0;
-              continue;
-            }
-            tp = (tp + 2) | 0; closed = true; break;
-          }
-          if (b2 === B_N || b2 === B_R) {
-            out[op] = B_BACKSLASH; out[op + 1] = B_N; op = (op + 2) | 0; line = (line + 1) | 0;
-            tp = (tp + (b2 === B_R && tp + 3 < textEnd && src[tp + 2] === B_BACKSLASH && src[tp + 3] === B_N ? 4 : 2)) | 0;
-            continue;
-          }
-          if (b2 === B_U) {
-            const nop = copyUnicodeCold(src, tp, out, op, false) | 0;
-            if (nop < 0) return -1;
-            op = nop; tp = (tp + 6) | 0; continue;
-          }
-          out[op] = B_BACKSLASH; out[op + 1] = b2; op = (op + 2) | 0; tp = (tp + 2) | 0;
-        }
-
-        let needCold = !closed;
-        if (closed) {
-          if (tp >= textEnd) { out[op++] = B_QUOTE; ended = 2; }
-          else {
-            const nb = src[tp];
-            if (nb === B_COMMA) { out[op++] = B_QUOTE; tp = (tp + 1) | 0; ended = 0; }
-            else if (nb === B_BACKSLASH && src[tp + 1] === B_N) { out[op++] = B_QUOTE; tp = (tp + 2) | 0; line = (line + 1) | 0; ended = 1; }
-            else if (nb === B_BACKSLASH && src[tp + 1] === B_R && tp + 3 < textEnd && src[tp + 2] === B_BACKSLASH && src[tp + 3] === B_N) {
-              out[op++] = B_QUOTE; tp = (tp + 4) | 0; line = (line + 1) | 0; ended = 1;
-            } else needCold = true;
-          }
-        }
-        if (needCold) {
-          const r = finishQuotedCold(src, textEnd, tp, out, op, openTp, openLine, openOp, line, closed, recordLine, rowIdx, ctx);
-          if (r < 0) return -1;
-          tp = ctx._tp; op = ctx._op; line = ctx._line; ended = r;
-        }
-      } else {
-        quoted = false;
-        out[op++] = B_QUOTE;
-
-        while (true) {
-          while (tp <= n4) {
-            const w = sdv.getInt32(tp, true);
-            ddv.setInt32(op, w, true);
-            const x1 = w ^ 0x2c2c2c2c;
-            const x2 = w ^ 0x5c5c5c5c;
-            const m = ((((x1 - 0x01010101) | 0) & ~x1) | (((x2 - 0x01010101) | 0) & ~x2)) & SWAR_MASK;
-            if (m === 0) { op = (op + 4) | 0; tp = (tp + 4) | 0; }
-            else {
-              const k = (31 - Math.clz32(m & -m)) >>> 3;
-              op = (op + k) | 0; tp = (tp + k) | 0;
-              break;
-            }
-          }
-          if (tp > n4) {
-            while (tp < textEnd) {
-              const b = src[tp];
-              if (b === B_COMMA || b === B_BACKSLASH) break;
-              out[op++] = b; tp = (tp + 1) | 0;
-            }
-          }
-          if (tp >= textEnd) { ended = 2; break; }
-
-          if (src[tp] === B_COMMA) {
-            tp = (tp + 1) | 0;
-            const nf = (fieldCount + 1) | 0;
-            if (nf < width && tp < textEnd && src[tp] !== B_BACKSLASH) {
-              ddv.setInt32(op, 0x00222c22, true); // `","`
-              op = (op + 3) | 0; fieldCount = nf;
-              continue;
-            }
-            ended = 0; break;
-          }
-          const b2 = src[tp + 1];
-          let eolStep = 0;
-          if (b2 === B_N) eolStep = 2;
-          else if (b2 === B_R) {
-            if (tp + 3 < textEnd && src[tp + 2] === B_BACKSLASH && src[tp + 3] === B_N) eolStep = 4;
-            else { pushSimpleErr(ctx, ERR_STRAY_CR, recordLine, rowIdx); tp = (tp + 2) | 0; continue; }
-          }
-          if (eolStep > 0) {
-            tp = (tp + eolStep) | 0; line = (line + 1) | 0;
-            if (fieldCount === widthMinus1 && tp < textEnd) {
-              const nb = src[tp];
-              if (nb !== B_BACKSLASH && nb !== B_COMMA && op < safeOutLimit) {
-                dataRowCount = (dataRowCount + 1) | 0;
-                ddv.setInt32(op, 0x5b2c5d22, true); // `"],[`
-                out[(op + 4) | 0] = B_QUOTE;
-                op = (op + 5) | 0;
-                fieldCount = 0; recordLine = line; rowIdx = dataRowCount;
-                continue;
-              }
-            }
-            ended = 1; break;
-          }
-          if (b2 === B_U) {
-            const nop = copyUnicodeCold(src, tp, out, op, true) | 0;
-            if (nop < 0) return -1;
-            op = nop; tp = (tp + 6) | 0; continue;
-          }
-          out[op] = B_BACKSLASH; out[op + 1] = b2; op = (op + 2) | 0; tp = (tp + 2) | 0;
-        }
-        out[op++] = B_QUOTE;
-      }
-
-      fieldCount = (fieldCount + 1) | 0;
-    } while (ended === 0);
-
-    if (fieldCount === 1 && !quoted && op === ((lastFieldStartOp + 2) | 0)) {
-      op = rowStartOp;
-      continue;
-    }
-
-    if (fieldCount === width) {
-      out[op++] = B_RBRACKET;
-      dataRowCount = (dataRowCount + 1) | 0;
-    } else {
-      const wasFirst = width < 0;
-      width = finishRowCold(ctx, out, op, width, fieldCount, recordLine, rowIdx, extraStartOp, headerVal);
-      widthMinus1 = (width - 1) | 0;
-      op = ctx._op;
-      if (wasFirst) dataRowCount = ctx._dr;
-      else dataRowCount = (dataRowCount + 1) | 0;
-    }
-  }
-
-  ctx.op = op; ctx.width = width; ctx.dataRowCount = dataRowCount;
-  return tp;
-}
-
-function findTextEndAndHeader(inBuf, src, textStart) {
+function findTextEndAndHeader(textStart, validLen) {
   let pos = textStart;
-  while (true) {
-    const rbrace = inBuf.indexOf(125, pos);
-    if (rbrace < 0) return null;
+  while (pos < validLen) {
+    const rbrace = IN_BUF.indexOf(125, pos);
+    if (rbrace < 0 || rbrace >= validLen) return null;
     let hdr = false, qPos = -1;
     if (
       rbrace >= textStart + 15 &&
-      src[rbrace - 1] === 101 && src[rbrace - 2] === 117 && src[rbrace - 3] === 114 && src[rbrace - 4] === 116 &&
-      src[rbrace - 5] === 58 && src[rbrace - 6] === 34 && src[rbrace - 7] === 114 && src[rbrace - 8] === 101 &&
-      src[rbrace - 9] === 100 && src[rbrace - 10] === 97 && src[rbrace - 11] === 101 && src[rbrace - 12] === 104 &&
-      src[rbrace - 13] === 34 && src[rbrace - 14] === 44 && src[rbrace - 15] === 34
+      IN_U8[rbrace - 1] === 101 && IN_U8[rbrace - 2] === 117 && IN_U8[rbrace - 3] === 114 && IN_U8[rbrace - 4] === 116 &&
+      IN_U8[rbrace - 5] === 58 && IN_U8[rbrace - 6] === 34 && IN_U8[rbrace - 7] === 114 && IN_U8[rbrace - 8] === 101 &&
+      IN_U8[rbrace - 9] === 100 && IN_U8[rbrace - 10] === 97 && IN_U8[rbrace - 11] === 101 && IN_U8[rbrace - 12] === 104 &&
+      IN_U8[rbrace - 13] === 34 && IN_U8[rbrace - 14] === 44 && IN_U8[rbrace - 15] === 34
     ) { hdr = true; qPos = rbrace - 15; }
     else if (
       rbrace >= textStart + 16 &&
-      src[rbrace - 1] === 101 && src[rbrace - 2] === 115 && src[rbrace - 3] === 108 && src[rbrace - 4] === 97 &&
-      src[rbrace - 5] === 102 && src[rbrace - 6] === 58 && src[rbrace - 7] === 34 && src[rbrace - 8] === 114 &&
-      src[rbrace - 9] === 101 && src[rbrace - 10] === 100 && src[rbrace - 11] === 97 && src[rbrace - 12] === 101 &&
-      src[rbrace - 13] === 104 && src[rbrace - 14] === 34 && src[rbrace - 15] === 44 && src[rbrace - 16] === 34
+      IN_U8[rbrace - 1] === 101 && IN_U8[rbrace - 2] === 115 && IN_U8[rbrace - 3] === 108 && IN_U8[rbrace - 4] === 97 &&
+      IN_U8[rbrace - 5] === 102 && IN_U8[rbrace - 6] === 58 && IN_U8[rbrace - 7] === 34 && IN_U8[rbrace - 8] === 114 &&
+      IN_U8[rbrace - 9] === 101 && IN_U8[rbrace - 10] === 100 && IN_U8[rbrace - 11] === 97 && IN_U8[rbrace - 12] === 101 &&
+      IN_U8[rbrace - 13] === 104 && IN_U8[rbrace - 14] === 34 && IN_U8[rbrace - 15] === 44 && IN_U8[rbrace - 16] === 34
     ) { hdr = false; qPos = rbrace - 16; }
     if (qPos >= textStart) {
       let bs = 0, k = qPos - 1;
-      while (k >= textStart && src[k] === 92) { bs++; k--; }
+      while (k >= textStart && IN_U8[k] === 92) { bs++; k--; }
       if ((bs & 1) === 0) return { textEnd: qPos, headerVal: hdr, afterInput: rbrace + 1 };
     }
     pos = rbrace + 1;
   }
+  return null;
 }
 
-function makeCtx(outRaw, ofd, flushAt) {
-  const out = new Uint8Array(outRaw.buffer, outRaw.byteOffset, outRaw.byteLength);
-  return {
-    outRaw, out, ddv: new DataView(outRaw.buffer, outRaw.byteOffset, outRaw.byteLength),
-    ofd, flushAt,
-    op: 0, width: -1, dataRowCount: 0,
-    errCodes: [], errLines: [], errRows: [], errFieldCnts: [], errExtraBufs: [],
-    _tp: 0, _op: 0, _dl: 0, _line: 1, _dr: 0,
-  };
+function writeErrorsAndCloseCase(headerVal) {
+  let op = ST[0];
+  if (op >= FLUSH_AT) { flushOutCold(op); op = 0; }
+  if (ST[1] < 0) {
+    const pfx = headerVal ? PFX_EMPTY_HDR : PFX_EMPTY_NOHDR;
+    OUT_U8.set(pfx, op); op += pfx.length;
+  } else {
+    OUT_U8.set(SFX_ERRORS, op); op += SFX_ERRORS.length;
+  }
+
+  const errCount = errCodes.length;
+  if (errCount > 0) {
+    let chunk = '';
+    for (let i = 0; i < errCount; i++) {
+      const code = errCodes[i];
+      const rIdx = errRows[i];
+      const rowStr = rIdx < 0 ? 'null' : '' + rIdx;
+      const pfx = (i > 0 ? ',' : '') + ERR_PFX_STR[code] + errLines[i] + ',"row":' + rowStr;
+      if (code === ERR_LONG_ROW) {
+        const extraBuf = errExtraBufs[i];
+        chunk += pfx + ',"extra":';
+        if (op + chunk.length + extraBuf.length + 16 > OUT_CAP) { flushOutCold(op); op = 0; }
+        if (chunk.length > 0) { op += OUT_BUF.latin1Write(chunk, op); chunk = ''; }
+        if (extraBuf.length + 16 > OUT_CAP) {
+          flushOutCold(op); op = 0;
+          const ofd = ST[3];
+          let woff = 0;
+          while (woff < extraBuf.length) woff += writeSync(ofd, extraBuf, woff, extraBuf.length - woff);
+          OUT_U8[op++] = B_RBRACE;
+        } else {
+          OUT_U8.set(extraBuf, op); op += extraBuf.length; OUT_U8[op++] = B_RBRACE;
+        }
+      } else if (code === ERR_SHORT_ROW) {
+        chunk += pfx + ',"fields":' + errFieldCnts[i] + '}';
+      } else {
+        chunk += pfx + '}';
+      }
+      if (chunk.length > 65536) {
+        if (op + chunk.length + 16 > OUT_CAP) { flushOutCold(op); op = 0; }
+        op += OUT_BUF.latin1Write(chunk, op); chunk = '';
+      }
+    }
+    if (chunk.length > 0) {
+      if (op + chunk.length + 16 > OUT_CAP) { flushOutCold(op); op = 0; }
+      op += OUT_BUF.latin1Write(chunk, op);
+    }
+  }
+
+  if (op + 8 > OUT_CAP) { flushOutCold(op); op = 0; }
+  OUT_U8[op++] = B_RBRACKET;
+  OUT_U8[op++] = B_RBRACE;
+  flushOutCold(op);
+  ST[0] = 0;
 }
 
-export function runCasesBuffer(inBuf, ofd = -1) {
-  const inLen = inBuf.length;
-  const src = new Uint8Array(inBuf.buffer, inBuf.byteOffset, inLen);
-  const sdv = new DataView(inBuf.buffer, inBuf.byteOffset, inLen);
+export function runCasesFiles(inputPath, outputPath) {
+  const ifd = openSync(inputPath, 'r');
+  const ofd = openSync(outputPath, 'w');
+  ST[0] = 0; ST[3] = ofd;
 
-  const hasFd = ofd >= 0;
-  const initSize = hasFd ? (512 * 1024 + 262144) : Math.max(65536, inLen + (inLen >>> 2) + 1024 * 1024);
-  const flushAt = hasFd ? (512 * 1024) : 0x7fffffff;
-  const ctx = makeCtx(Buffer.allocUnsafe(initSize), ofd, flushAt);
+  let validLen = 0, eof = false, filePos = 0;
+  function fillWindow(keepFrom) {
+    if (keepFrom > 0) {
+      const rem = validLen - keepFrom;
+      if (rem > 0) IN_U8.copyWithin(0, keepFrom, validLen);
+      validLen = rem;
+    }
+    while (!eof && validLen < IN_CAP) {
+      const n = readSync(ifd, IN_BUF, validLen, IN_CAP - validLen, filePos);
+      if (n <= 0) { eof = true; break; }
+      validLen += n;
+      filePos += n;
+    }
+    return 0;
+  }
 
-  let p = skipWs(src, 0, inLen);
-  if (p >= inLen || src[p] !== B_LBRACKET) {
-    const cases = JSON.parse(inBuf.toString('utf8'));
+  let p = fillWindow(0);
+
+  function fallbackFullFile() {
+    closeSync(ifd);
+    closeSync(ofd);
+    const cases = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
     const answers = [];
     for (let i = 0; i < cases.length; i++) answers.push(run(cases[i].input));
-    const buf = Buffer.from(JSON.stringify(answers), 'utf8');
-    if (hasFd) { flushOutCold(ofd, buf, buf.length); return null; }
-    return buf;
+    fs.writeFileSync(outputPath, JSON.stringify(answers), 'utf8');
   }
-  p++;
-  ctx.out[ctx.op++] = B_LBRACKET;
 
-  let caseIdx = 0, totalRowsParsed = 0;
+  p = skipWs(IN_U8, p, validLen);
+  if (p >= validLen || IN_U8[p] !== B_LBRACKET) { fallbackFullFile(); return; }
+  p++;
+  OUT_U8[0] = B_LBRACKET;
+  ST[0] = 1;
+
+  let caseIdx = 0;
   while (true) {
-    p = skipWs(src, p, inLen);
-    if (p >= inLen || src[p] === B_RBRACKET) break;
+    // Ensure a full case (~2.1 MB) sits contiguously in our 2.5 MB sliding window!
+    if (!eof && (validLen - p) < 2200000) p = fillWindow(p);
+    p = skipWs(IN_U8, p, validLen);
+    if (p >= validLen || IN_U8[p] === B_RBRACKET) break;
     if (caseIdx > 0) {
-      if (src[p] === B_COMMA) { p++; p = skipWs(src, p, inLen); }
-      ctx.out[ctx.op++] = B_COMMA;
+      if (IN_U8[p] === B_COMMA) { p++; p = skipWs(IN_U8, p, validLen); }
+      OUT_U8[ST[0]++] = B_COMMA;
     }
     caseIdx++;
 
-    if (src[p] !== B_LBRACE) {
-      const cases = JSON.parse(inBuf.toString('utf8'));
-      const answers = [];
-      for (let i = 0; i < cases.length; i++) answers.push(run(cases[i].input));
-      const buf = Buffer.from(JSON.stringify(answers), 'utf8');
-      if (hasFd) { flushOutCold(ofd, buf, buf.length); return null; }
-      return buf;
-    }
-
-    const caseObjStart = p, caseOutStart = ctx.op;
+    if (IN_U8[p] !== B_LBRACE) { fallbackFullFile(); return; }
+    const caseObjStart = p;
     p++;
 
     let parseOk = false, headerVal = false, textStart = -1, textEnd = -1, usedFastHeader = false;
-    ctx.width = -1; ctx.dataRowCount = 0;
-    ctx.errCodes = []; ctx.errLines = []; ctx.errRows = []; ctx.errFieldCnts = []; ctx.errExtraBufs = [];
+    ST[1] = -1; ST[2] = 0;
+    resetErrors();
 
-    while (p < inLen) {
-      p = skipWs(src, p, inLen);
-      if (src[p] === B_RBRACE) { p++; break; }
-      if (src[p] === B_COMMA) { p++; p = skipWs(src, p, inLen); }
-      if (src[p] !== B_QUOTE) break;
-      const kStart = p + 1, kEndQ = skipJsonString(src, p, inLen);
+    while (p < validLen) {
+      p = skipWs(IN_U8, p, validLen);
+      if (IN_U8[p] === B_RBRACE) { p++; break; }
+      if (IN_U8[p] === B_COMMA) { p++; p = skipWs(IN_U8, p, validLen); }
+      if (IN_U8[p] !== B_QUOTE) break;
+      const kStart = p + 1, kEndQ = skipJsonString(IN_U8, p, validLen);
       if (kEndQ < 0) break;
       const kEnd = kEndQ - 1;
-      p = skipWs(src, kEndQ, inLen);
-      if (src[p] !== B_COLON) break;
-      p = skipWs(src, p + 1, inLen);
+      p = skipWs(IN_U8, kEndQ, validLen);
+      if (IN_U8[p] !== B_COLON) break;
+      p = skipWs(IN_U8, p + 1, validLen);
 
-      if (keyEquals(src, kStart, kEnd, 'input')) {
-        if (src[p] !== B_LBRACE) break;
+      if (keyEquals(IN_U8, kStart, kEnd, 'input')) {
+        if (IN_U8[p] !== B_LBRACE) break;
         p++;
-        while (p < inLen) {
-          p = skipWs(src, p, inLen);
-          if (src[p] === B_RBRACE) { p++; break; }
-          if (src[p] === B_COMMA) { p++; p = skipWs(src, p, inLen); }
-          if (src[p] !== B_QUOTE) break;
-          const ikStart = p + 1, ikEndQ = skipJsonString(src, p, inLen);
+        while (p < validLen) {
+          p = skipWs(IN_U8, p, validLen);
+          if (IN_U8[p] === B_RBRACE) { p++; break; }
+          if (IN_U8[p] === B_COMMA) { p++; p = skipWs(IN_U8, p, validLen); }
+          if (IN_U8[p] !== B_QUOTE) break;
+          const ikStart = p + 1, ikEndQ = skipJsonString(IN_U8, p, validLen);
           if (ikEndQ < 0) break;
           const ikEnd = ikEndQ - 1;
-          p = skipWs(src, ikEndQ, inLen);
-          if (src[p] !== B_COLON) break;
-          p = skipWs(src, p + 1, inLen);
+          p = skipWs(IN_U8, ikEndQ, validLen);
+          if (IN_U8[p] !== B_COLON) break;
+          p = skipWs(IN_U8, p + 1, validLen);
 
-          if (keyEquals(src, ikStart, ikEnd, 'text')) {
-            if (src[p] !== B_QUOTE) break;
+          if (keyEquals(IN_U8, ikStart, ikEnd, 'text')) {
+            if (IN_U8[p] !== B_QUOTE) break;
             textStart = p + 1;
-            const fast = findTextEndAndHeader(inBuf, src, textStart);
+            const fast = findTextEndAndHeader(textStart, validLen);
             if (fast) {
               textEnd = fast.textEnd; headerVal = fast.headerVal; p = fast.afterInput;
               parseOk = true; usedFastHeader = true; break;
             }
-            const endQ = skipJsonString(src, p, inLen);
+            const endQ = skipJsonString(IN_U8, p, validLen);
             if (endQ < 0) break;
             textEnd = endQ - 1; p = endQ; parseOk = true;
-          } else if (keyEquals(src, ikStart, ikEnd, 'header')) {
-            if (src[p] === 116 && src[p + 1] === 114 && src[p + 2] === 117 && src[p + 3] === 101) { headerVal = true; p += 4; }
-            else if (src[p] === 102 && src[p + 1] === 97 && src[p + 2] === 108 && src[p + 3] === 115 && src[p + 4] === 101) { headerVal = false; p += 5; }
-            else { headerVal = false; p = skipJsonValue(src, p, inLen); }
+          } else if (keyEquals(IN_U8, ikStart, ikEnd, 'header')) {
+            if (IN_U8[p] === 116 && IN_U8[p + 1] === 114 && IN_U8[p + 2] === 117 && IN_U8[p + 3] === 101) { headerVal = true; p += 4; }
+            else if (IN_U8[p] === 102 && IN_U8[p + 1] === 97 && IN_U8[p + 2] === 108 && IN_U8[p + 3] === 115 && IN_U8[p + 4] === 101) { headerVal = false; p += 5; }
+            else { headerVal = false; p = skipJsonValue(IN_U8, p, validLen); }
           } else {
-            p = skipJsonValue(src, p, inLen);
+            p = skipJsonValue(IN_U8, p, validLen);
             if (p < 0) { parseOk = false; break; }
           }
         }
         if (usedFastHeader) {
-          p = skipWs(src, p, inLen);
-          if (src[p] === B_RBRACE) p++;
+          p = skipWs(IN_U8, p, validLen);
+          if (IN_U8[p] === B_RBRACE) p++;
           else parseOk = false;
           break;
         }
       } else {
-        p = skipJsonValue(src, p, inLen);
+        p = skipJsonValue(IN_U8, p, validLen);
         if (p < 0) break;
       }
     }
 
     if (parseOk && textStart >= 0 && textEnd >= textStart) {
       let tp = textStart;
-      if (tp + 2 < textEnd && src[tp] === 239 && src[tp + 1] === 187 && src[tp + 2] === 191) tp += 3;
-      else if (tp + 5 < textEnd && src[tp] === B_BACKSLASH && src[tp + 1] === B_U && parseHex4(src, tp + 2) === 0xfeff) tp += 6;
-
-      const r = csvParse(src, sdv, textEnd, tp, ctx, headerVal);
-      if (r < 0) parseOk = false;
-    }
-
-    if (!parseOk) {
-      ctx.op = caseOutStart;
-      const caseObjEnd = skipJsonValue(src, caseObjStart, inLen);
-      const caseObj = JSON.parse(inBuf.toString('utf8', caseObjStart, caseObjEnd));
-      const ans = run(caseObj.input);
-      const ansBuf = Buffer.from(JSON.stringify(ans), 'utf8');
-      if (ctx.op + ansBuf.length + 16 > ctx.out.length) growOutBuf(ctx, ctx.op, ctx.op + ansBuf.length + 65536);
-      ctx.out.set(ansBuf, ctx.op);
-      ctx.op += ansBuf.length;
-      if (hasFd) { flushOutCold(ofd, ctx.out, ctx.op); ctx.op = 0; }
-      p = caseObjEnd;
-      continue;
-    }
-
-    let out = ctx.out, outRaw = ctx.outRaw, op = ctx.op;
-    if (ctx.width < 0) {
-      if (op + 1024 > out.length) { growOutBuf(ctx, op, op + 4096); out = ctx.out; outRaw = ctx.outRaw; }
-      const pfx = headerVal ? PFX_EMPTY_HDR : PFX_EMPTY_NOHDR;
-      out.set(pfx, op); op += pfx.length;
+      if (tp + 2 < textEnd && IN_U8[tp] === 239 && IN_U8[tp + 1] === 187 && IN_U8[tp + 2] === 191) tp += 3;
+      else if (tp + 5 < textEnd && IN_U8[tp] === B_BACKSLASH && IN_U8[tp + 1] === B_U && parseHex4(IN_U8, tp + 2) === 0xfeff) tp += 6;
+      const r = csvParse(tp, textEnd, headerVal);
+      if (r < 0) { fallbackFullFile(); return; }
+      writeErrorsAndCloseCase(headerVal);
     } else {
-      if (op + 64 > out.length) { growOutBuf(ctx, op, op + 4096); out = ctx.out; outRaw = ctx.outRaw; }
-      out.set(SFX_ERRORS, op); op += SFX_ERRORS.length;
+      // Fallback: if single case didn't fit in 2.5MB window or weird JSON, parse whole file safely
+      if (caseObjStart === 0 && !eof) { fallbackFullFile(); return; }
+      const caseObjEnd = skipJsonValue(IN_U8, caseObjStart, validLen);
+      if (caseObjEnd < 0) { fallbackFullFile(); return; }
+      const caseObj = JSON.parse(IN_BUF.toString('utf8', caseObjStart, caseObjEnd));
+      const ansBuf = Buffer.from(JSON.stringify(run(caseObj.input)), 'utf8');
+      flushOutCold(ST[0]); ST[0] = 0;
+      let woff = 0;
+      while (woff < ansBuf.length) woff += writeSync(ofd, ansBuf, woff, ansBuf.length - woff);
+      p = caseObjEnd;
     }
-
-    // Ultra-fast error serialization via V8 C++ ConsString + latin1Write / memcpy (~0.2 ms total!)
-    const errCodes = ctx.errCodes, errLines = ctx.errLines, errRows = ctx.errRows;
-    const errFieldCnts = ctx.errFieldCnts, errExtraBufs = ctx.errExtraBufs;
-    const errCount = errCodes.length;
-    if (errCount > 0) {
-      let chunk = '';
-      for (let i = 0; i < errCount; i++) {
-        const code = errCodes[i];
-        const rIdx = errRows[i];
-        const rowStr = rIdx < 0 ? 'null' : '' + rIdx;
-        const pfx = (i > 0 ? ',' : '') + ERR_PFX_STR[code] + errLines[i] + ',"row":' + rowStr;
-        if (code === ERR_LONG_ROW) {
-          const extraBuf = errExtraBufs[i];
-          chunk += pfx + ',"extra":';
-          const need = chunk.length + extraBuf.length + 16;
-          if (op + need > out.length) { growOutBuf(ctx, op, op + need + 65536); out = ctx.out; outRaw = ctx.outRaw; }
-          op += outRaw.latin1Write(chunk, op);
-          chunk = '';
-          out.set(extraBuf, op);
-          op += extraBuf.length;
-          out[op++] = B_RBRACE;
-        } else if (code === ERR_SHORT_ROW) {
-          chunk += pfx + ',"fields":' + errFieldCnts[i] + '}';
-        } else {
-          chunk += pfx + '}';
-        }
-      }
-      if (chunk.length > 0) {
-        if (op + chunk.length + 16 > out.length) { growOutBuf(ctx, op, op + chunk.length + 65536); out = ctx.out; outRaw = ctx.outRaw; }
-        op += outRaw.latin1Write(chunk, op);
-      }
-    }
-
-    if (op + 4 > out.length) { growOutBuf(ctx, op, op + 16); out = ctx.out; }
-    out[op++] = B_RBRACKET;
-    out[op++] = B_RBRACE;
-    if (hasFd) { flushOutCold(ofd, out, op); ctx.op = 0; }
-    else { ctx.op = op; }
   }
 
-  if (ctx.op + 2 > ctx.out.length) growOutBuf(ctx, ctx.op, ctx.op + 16);
-  ctx.out[ctx.op++] = B_RBRACKET;
-  if (hasFd) { flushOutCold(ofd, ctx.out, ctx.op); return null; }
-  return ctx.out.subarray(0, ctx.op);
+  OUT_U8[ST[0]++] = B_RBRACKET;
+  flushOutCold(ST[0]);
+  closeSync(ifd);
+  closeSync(ofd);
 }
 
-export function primeCsv(waitMs = 50) {
-  const s1Buf = Buffer.from(
-    'alpha_1234,bravo_5678\\r\\n\\n\\r\\n\\r\\r\\nplain_1234,plain_5678\\r\\nplain_aaaa,plain_bbbb\\nplain_cccc,plain_dddd\\n\\"quoted_1234\\"\\"more\\r\\nline2\\rline3\\nline4\\\\end\\",\\"q_lf_1234\\"\\n\\"q_crlf_1234\\",\\"q_crlf2\\"\\r\\n\\"junk_1234\\"xy,stray\\rcr_1234\\r\\nshort_1234\\nlong1_1234,long2_1234,long3_1234\\n\\"unterm_1234_xy'
-  );
-  const src1 = new Uint8Array(s1Buf.buffer, s1Buf.byteOffset, s1Buf.byteLength);
-  const sdv1 = new DataView(s1Buf.buffer, s1Buf.byteOffset, s1Buf.byteLength);
-  const s2Buf = Buffer.from('alpha_1234,bravo_5678\\n\\"quoted_eof_1234\\",\\"quoted_eof2\\"');
-  const src2 = new Uint8Array(s2Buf.buffer, s2Buf.byteOffset, s2Buf.byteLength);
-  const sdv2 = new DataView(s2Buf.buffer, s2Buf.byteOffset, s2Buf.byteLength);
-  const s3Buf = Buffer.from('alpha_1234,bravo_5678\\nmid\\"q,eof_tail_xy');
-  const src3 = new Uint8Array(s3Buf.buffer, s3Buf.byteOffset, s3Buf.byteLength);
-  const sdv3 = new DataView(s3Buf.buffer, s3Buf.byteOffset, s3Buf.byteLength);
-  const ctxA = makeCtx(Buffer.allocUnsafe(81920), -1, 128);
-  const ctxB = makeCtx(Buffer.allocUnsafe(81924), -1, 65536);
-  ctxA._tp = 1; ctxA._op = 1; ctxA._dl = 1; ctxA._line = 2; ctxA._dr = 1;
-  // Phase 1: 100% branch feedback across all 3 samples + flushFn + header true/false + 2 ctx instances
+export function primeCsv(waitMs = 100) {
+  const s1 = 'alpha_1234,bravo_5678\\r\\n\\n\\r\\n\\r\\r\\nplain_1234,plain_5678\\r\\nplain_aaaa,plain_bbbb\\nplain_cccc,plain_dddd\\n\\"quoted_1234\\"\\"more\\r\\nline2\\rline3\\nline4\\\\end\\",\\"q_lf_1234\\"\\n\\"q_crlf_1234\\",\\"q_crlf2\\"\\r\\n\\"junk_1234\\"xy,stray\\rcr_1234\\r\\nshort_1234\\nlong1_1234,long2_1234,long3_1234\\n\\"unterm_1234_xy';
+  const s2 = 'alpha_1234,bravo_5678\\n\\"quoted_eof_1234\\",\\"quoted_eof2\\"';
+  const s3 = 'alpha_1234,bravo_5678\\nmid\\"q,eof_tail_xy';
+  const n1 = IN_BUF.write(s1, 0, 'utf8');
+  const n2 = IN_BUF.write(s2, 512, 'utf8');
+  const n3 = IN_BUF.write(s3, 1024, 'utf8');
+
+  ST[3] = -1; // ofd = -1 (no flush during warmup)
+  // Phase 1: 100% branch feedback (including op >= FLUSH_AT branch!)
   for (let k = 0; k < 2; k++) {
     const hdr = k === 0;
-    const c = k === 0 ? ctxA : ctxB;
-    c.op = 0; c.errCodes = []; c.errLines = []; c.errRows = []; c.errFieldCnts = []; c.errExtraBufs = [];
-    csvParse(src1, sdv1, src1.length, 0, c, hdr);
-    c.op = 0; c.errCodes = []; c.errLines = []; c.errRows = []; c.errFieldCnts = []; c.errExtraBufs = [];
-    csvParse(src2, sdv2, src2.length, 0, c, hdr);
-    c.op = 0; c.errCodes = []; c.errLines = []; c.errRows = []; c.errFieldCnts = []; c.errExtraBufs = [];
-    csvParse(src3, sdv3, src3.length, 0, c, hdr);
+    ST[0] = FLUSH_AT; resetErrors(); csvParse(0, n1, hdr);
+    ST[0] = 0; resetErrors(); csvParse(512, 512 + n2, hdr);
+    ST[0] = 0; resetErrors(); csvParse(1024, 1024 + n3, hdr);
   }
-  // Phase 2: trigger single background TurboFan compile
-  ctxB.flushAt = 65536;
-  for (let k = 0; k < 34; k++) {
-    ctxB.op = 0; ctxB.errCodes = []; ctxB.errLines = []; ctxB.errRows = []; ctxB.errFieldCnts = []; ctxB.errExtraBufs = [];
-    csvParse(src1, sdv1, src1.length, 0, ctxB, true);
+  // Phase 2: trigger single background TurboFan compile on tiny s1
+  for (let k = 0; k < 32; k++) {
+    ST[0] = 0; resetErrors(); csvParse(0, n1, true);
   }
   // Zero-CPU wait so background TurboFan finishes cleanly on 1-CPU sandbox!
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
-  // 1 tiny call to install compiled code onto csvParse!
-  ctxB.op = 0; ctxB.errCodes = []; ctxB.errLines = []; ctxB.errRows = []; ctxB.errFieldCnts = []; ctxB.errExtraBufs = [];
-  csvParse(src2, sdv2, src2.length, 0, ctxB, true);
+  Atomics.wait(WAIT_I32, 0, 0, waitMs);
+  // Install compiled code
+  ST[0] = 0; resetErrors(); csvParse(512, 512 + n2, true);
+  resetErrors();
 }
