@@ -1,9 +1,9 @@
+import './flags.js';
 import { openSync, fstatSync, readSync, writeSync, closeSync } from 'node:fs';
 import { setFlagsFromString } from 'node:v8';
+import { runCasesBuffer, primeCsv } from './solve.js';
 
-setFlagsFromString('--no-incremental-marking');
-
-const { runCasesBuffer } = await import(new URL('./solve.js', import.meta.url).href);
+primeCsv(setFlagsFromString);
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
@@ -19,12 +19,11 @@ while (off < sz) {
 }
 closeSync(fd);
 
-const answers = runCasesBuffer(raw);
-
 const ofd = openSync(`${OUTPUT_DIR}/answers.json`, 'w');
-let woff = 0;
-const wlen = answers.length;
-while (woff < wlen) {
-  woff += writeSync(ofd, answers, woff, wlen - woff);
-}
+runCasesBuffer(raw, (buf: Uint8Array, len: number) => {
+  let woff = 0;
+  while (woff < len) {
+    woff += writeSync(ofd, buf, woff, len - woff);
+  }
+});
 closeSync(ofd);
