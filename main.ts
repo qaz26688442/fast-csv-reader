@@ -1,9 +1,9 @@
 const v8 = process.getBuiltinModule('node:v8');
 v8.setFlagsFromString(
-  '--no-incremental-marking --turbo-filter=csvParse --no-use-osr --no-turbo-inlining --invocation-count-for-feedback-allocation=1 --invocation-count-for-turbofan=8'
+  '--no-incremental-marking --turbo-filter=csvParse --no-use-osr --no-turbo-inlining --no-turbo-escape --no-turbo-allocation-folding --invocation-count-for-feedback-allocation=1 --invocation-count-for-turbofan=8'
 );
 
-const { runCasesFiles, primeCsv } = await import('./solve.js');
+const { runCasesFiles, primeCsv } = require('./engine.cjs');
 primeCsv(120);
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
