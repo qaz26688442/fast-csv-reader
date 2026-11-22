@@ -1,8 +1,8 @@
-// High-throughput drop-in replacement for csv-reader 1.0.0 (V19 Sentinel - Secret Weapon).
-//   - Pure-CJS zero-ESM-loader execution (`main.ts` -> `require('./engine.cjs')`; `solve.js` ESM wrapper)
-//   - 0x0000005c (`\` + `\0\0\0`) sentinel at `textEnd` eliminates ALL `tp <= n4`, tail loops,
-//     and `tp < textEnd` bounds checks from BOTH unquoted and quoted SWAR loops!
-//   - Fixed-closure single-ArrayBuffer streaming + zero-deopt Atomics.wait single TurboFan compile.
+// High-throughput drop-in replacement for csv-reader 1.0.0 (V20: 512 KiB L2-Hot Chunk-Streaming SWAR).
+//   - 512 KiB SINGLE ArrayBuffer (256 KiB IN + 256 KiB OUT = 128 pages total, 100% L2-cache resident!)
+//   - Zero-copy 33-byte Rec0 pwrite patch (24B pre + 9B post) enables true chunk-streaming before reading `"header"`
+//   - 0x0000005c (`\` + 0,0,0) sentinel + 5-register tight nested 4B SWAR + --no-maglev single TurboFan compile
+//   - Lean CJS engine (fallback `run()` lives in separate `fallback.cjs`, never parsed on hot path)
 
 const fs = process.getBuiltinModule('node:fs');
 const { openSync, readSync, writeSync, closeSync } = fs;
@@ -13,20 +13,24 @@ const ERR_QUOTE_JUNK = 2;
 const ERR_SHORT_ROW = 3;
 const ERR_LONG_ROW = 4;
 
-const IN_CAP = 2621440;   // 2.5 MiB input window (+16B sentinel slack)
-const IN_READ = 2621424;  // leave 16 bytes sentinel room at end
-const OUT_CAP = 1048576;  // 1.0 MiB output window
-const FLUSH_AT = 524288;  // 512 KiB L2-hot flush
-const SAFE_OUT = 960000;
+const IN_CAP = 262144;    // 256 KiB L2-hot input window (+16B sentinel slack)
+const IN_READ = 262128;
+const OUT_CAP = 262144;   // 256 KiB L2-hot output window
+const FLUSH_AT = 196608;  // 192 KiB flush threshold (leaves 64 KiB single-row headroom)
+const SAFE_OUT = 245760;  // 240 KiB overflow guard
 
-const MEM = new ArrayBuffer(IN_CAP + OUT_CAP);
+const MEM = new ArrayBuffer(IN_CAP + OUT_CAP); // 512 KiB total = 128 x 4 KiB pages!
 const IN_BUF = Buffer.from(MEM, 0, IN_CAP);
 const IN_U8 = new Uint8Array(MEM, 0, IN_CAP);
 const IN_DV = new DataView(MEM, 0, IN_CAP);
 const OUT_BUF = Buffer.from(MEM, IN_CAP, OUT_CAP);
 const OUT_U8 = new Uint8Array(MEM, IN_CAP, OUT_CAP);
 const OUT_DV = new DataView(MEM, IN_CAP, OUT_CAP);
-const ST = new Int32Array(8);
+
+// ST[0]=op, ST[1]=width, ST[2]=recCount, ST[3]=ofd, ST[4]=coldTp, ST[5]=coldOp,
+// ST[6]=coldLine, ST[7]=line, ST[8]=outFilePos, ST[9]=casePreOff, ST[10]=casePostOff,
+// ST[11..14]=recStart(tp, line, op, errLen)
+const ST = new Int32Array(16);
 const WAIT_I32 = new Int32Array(new SharedArrayBuffer(4));
 
 const HEX_VAL = new Int8Array(128).fill(-1);
@@ -42,106 +46,11 @@ function parseHex4(buf, p) {
   return (va << 12) | (vb << 8) | (vc << 4) | vd;
 }
 
-function run(input) {
-  const text = String(input.text), header = input.header === true, len = text.length;
-  const errors = [], rows = [];
-  let columns = null, width = -1, pos = len > 0 && text.charCodeAt(0) === 0xfeff ? 1 : 0, line = 1;
-  while (true) {
-    while (pos < len) {
-      const c = text.charCodeAt(pos);
-      if (c === 10) { pos++; line++; }
-      else if (c === 13 && pos + 1 < len && text.charCodeAt(pos + 1) === 10) { pos += 2; line++; }
-      else break;
-    }
-    if (pos >= len) break;
-    const recordLine = line, recordRow = header && columns === null ? null : rows.length, fields = [];
-    let quoted = false, ended = 0;
-    do {
-      quoted = pos < len && text.charCodeAt(pos) === 34;
-      let val = '';
-      if (!quoted) {
-        let start = pos, hasStray = false; ended = 2;
-        while (pos < len) {
-          const c = text.charCodeAt(pos);
-          if (c === 44) { val = hasStray ? val + text.slice(start, pos) : text.slice(start, pos); pos++; ended = 0; break; }
-          if (c === 10) { val = hasStray ? val + text.slice(start, pos) : text.slice(start, pos); pos++; line++; ended = 1; break; }
-          if (c === 13) {
-            if (pos + 1 < len && text.charCodeAt(pos + 1) === 10) { val = hasStray ? val + text.slice(start, pos) : text.slice(start, pos); pos += 2; line++; ended = 1; break; }
-            val += text.slice(start, pos); errors.push({ code: 'stray_cr', line: recordLine, row: recordRow }); pos++; start = pos; hasStray = true; continue;
-          }
-          pos++;
-        }
-        if (ended === 2) val = hasStray ? val + text.slice(start, pos) : text.slice(start, pos);
-      } else {
-        const open = pos, openLine = line; pos++;
-        let start = pos, hasSpecial = false, closed = false;
-        while (pos < len) {
-          const c = text.charCodeAt(pos);
-          if (c === 34) {
-            if (pos + 1 < len && text.charCodeAt(pos + 1) === 34) { val += text.slice(start, pos + 1); pos += 2; start = pos; hasSpecial = true; continue; }
-            val = hasSpecial ? val + text.slice(start, pos) : text.slice(start, pos); pos++; closed = true; break;
-          }
-          if (c === 13) { val += text.slice(start, pos) + '\n'; line++; pos += pos + 1 < len && text.charCodeAt(pos + 1) === 10 ? 2 : 1; start = pos; hasSpecial = true; continue; }
-          if (c === 10) line++;
-          pos++;
-        }
-        if (!closed) {
-          pos = open + 1; line = openLine; errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
-          val = '"'; let start2 = pos; ended = 2;
-          while (pos < len) {
-            const c = text.charCodeAt(pos);
-            if (c === 44) { val += text.slice(start2, pos); pos++; ended = 0; break; }
-            if (c === 10) { val += text.slice(start2, pos); pos++; line++; ended = 1; break; }
-            if (c === 13) {
-              if (pos + 1 < len && text.charCodeAt(pos + 1) === 10) { val += text.slice(start2, pos); pos += 2; line++; ended = 1; break; }
-              val += text.slice(start2, pos); errors.push({ code: 'stray_cr', line: recordLine, row: recordRow }); pos++; start2 = pos; continue;
-            }
-            pos++;
-          }
-          if (ended === 2) val += text.slice(start2, pos);
-        } else if (pos >= len) { ended = 2; }
-        else {
-          const nc = text.charCodeAt(pos);
-          if (nc === 44) { pos++; ended = 0; }
-          else if (nc === 10) { pos++; line++; ended = 1; }
-          else if (nc === 13 && pos + 1 < len && text.charCodeAt(pos + 1) === 10) { pos += 2; line++; ended = 1; }
-          else {
-            let start2 = pos, added = 0; ended = 2;
-            while (pos < len) {
-              const c = text.charCodeAt(pos);
-              if (c === 44) { const n = pos - start2; if (n > 0) { val += text.slice(start2, pos); added += n; } pos++; ended = 0; break; }
-              if (c === 10) { const n = pos - start2; if (n > 0) { val += text.slice(start2, pos); added += n; } pos++; line++; ended = 1; break; }
-              if (c === 13) {
-                if (pos + 1 < len && text.charCodeAt(pos + 1) === 10) { const n = pos - start2; if (n > 0) { val += text.slice(start2, pos); added += n; } pos += 2; line++; ended = 1; break; }
-                const n = pos - start2; if (n > 0) { val += text.slice(start2, pos); added += n; }
-                errors.push({ code: 'stray_cr', line: recordLine, row: recordRow }); pos++; start2 = pos; continue;
-              }
-              pos++;
-            }
-            if (ended === 2) { const n = pos - start2; if (n > 0) { val += text.slice(start2, pos); added += n; } }
-            if (added > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
-          }
-        }
-      }
-      fields.push(val);
-    } while (ended === 0);
-    if (fields.length === 1 && fields[0].length === 0 && !quoted) continue;
-    if (width < 0) width = fields.length;
-    if (header && columns === null) { columns = fields; continue; }
-    if (fields.length < width) {
-      errors.push({ code: 'short_row', line: recordLine, row: recordRow, fields: fields.length });
-      while (fields.length < width) fields.push('');
-    } else if (fields.length > width) {
-      errors.push({ code: 'long_row', line: recordLine, row: recordRow, extra: fields.splice(width) });
-    }
-    rows.push(fields);
-  }
-  return { columns: header ? (columns ?? []) : null, rows, errors };
-}
-
-const PFX_COLS = Buffer.from('{"columns":');
-const PFX_MID_ROWS = Buffer.from(',"rows":[');
-const PFX_NULL_ROWS = Buffer.from('{"columns":null,"rows":[');
+const PRE_HDR = Buffer.from('             {"columns":');         // 24 bytes
+const PRE_NOHDR = Buffer.from('{"columns":null,"rows":[');       // 24 bytes
+const POST_HDR = Buffer.from(',"rows":[');                       // 9 bytes
+const POST_NOHDR_MORE = Buffer.from(',        ');                // 9 bytes
+const POST_NOHDR_ONLY = Buffer.from('         ');                // 9 bytes
 const PFX_EMPTY_HDR = Buffer.from('{"columns":[],"rows":[],"errors":[');
 const PFX_EMPTY_NOHDR = Buffer.from('{"columns":null,"rows":[],"errors":[');
 const SFX_ERRORS = Buffer.from('],"errors":[');
@@ -157,18 +66,30 @@ let errCodes = [], errLines = [], errRows = [], errFieldCnts = [], errExtraBufs 
 function resetErrors() {
   errCodes = []; errLines = []; errRows = []; errFieldCnts = []; errExtraBufs = [];
 }
+function rollbackRecCold(width, recCount) {
+  const n = ST[14];
+  errCodes.length = n; errLines.length = n; errRows.length = n;
+  errFieldCnts.length = n; errExtraBufs.length = n;
+  ST[0] = ST[13]; ST[1] = width; ST[2] = recCount; ST[7] = ST[12];
+  return ST[11];
+}
 
 function flushOutCold(op) {
   const ofd = ST[3];
   if (ofd < 0 || op <= 0) return;
+  let pos = ST[8];
   let woff = 0;
-  while (woff < op) woff += writeSync(ofd, OUT_U8, woff, op - woff);
+  while (woff < op) {
+    const n = writeSync(ofd, OUT_U8, woff, op - woff, pos + woff);
+    woff += n;
+  }
+  ST[8] = pos + op;
 }
 
-function writeRowPrefixCold(op, headerVal) {
-  const pfx = headerVal ? PFX_COLS : PFX_NULL_ROWS;
-  OUT_U8.set(pfx, op);
-  return op + pfx.length;
+function writeRowPrefixCold(op) {
+  // Reserve 24-byte slot before Rec0; patched at end of case once `header` is known.
+  ST[9] = ST[8] + op;
+  return op + 24;
 }
 
 function pushSimpleErr(code, line, rowIdx) {
@@ -185,7 +106,7 @@ function copyUnicodeCold(tp, op, checkComma) {
   return op + 6;
 }
 
-function scanUnquotedSlow(textEnd, tp, op, recordLine, rowIdx) {
+function scanUnquotedSlow(textEnd, tp, op, recordLine, rowIdx, isFinalChunk) {
   let dl = 0, ended = 2;
   while (tp < textEnd) {
     if (op >= SAFE_OUT) return -2;
@@ -207,24 +128,25 @@ function scanUnquotedSlow(textEnd, tp, op, recordLine, rowIdx) {
     OUT_U8[op] = 92; OUT_U8[op + 1] = b2;
     op += 2; tp += 2;
   }
+  if (ended === 2 && !isFinalChunk) return -3;
   ST[4] = tp; ST[5] = op; ST[6] = dl;
   return ended;
 }
 
-function finishQuotedCold(textEnd, tp, op, openTp, openLine, openOp, line, closed, recordLine, rowIdx) {
+function finishQuotedCold(textEnd, tp, op, openTp, openLine, openOp, line, closed, recordLine, rowIdx, isFinalChunk) {
   if (!closed) {
     tp = openTp + 2; line = openLine; op = openOp;
     pushSimpleErr(ERR_UNTERMINATED, recordLine, rowIdx);
     OUT_U8[op] = 34; OUT_U8[op + 1] = 92; OUT_U8[op + 2] = 34;
     op += 3;
-    const r = scanUnquotedSlow(textEnd, tp, op, recordLine, rowIdx);
+    const r = scanUnquotedSlow(textEnd, tp, op, recordLine, rowIdx, isFinalChunk);
     if (r < 0) return r;
     OUT_U8[ST[5]++] = 34;
     ST[6] = line + ST[6];
     return r;
   }
   const opBeforeJunk = op;
-  const r = scanUnquotedSlow(textEnd, tp, op, recordLine, rowIdx);
+  const r = scanUnquotedSlow(textEnd, tp, op, recordLine, rowIdx, isFinalChunk);
   if (r < 0) return r;
   if (ST[5] > opBeforeJunk) pushSimpleErr(ERR_QUOTE_JUNK, recordLine, rowIdx);
   OUT_U8[ST[5]++] = 34;
@@ -232,11 +154,11 @@ function finishQuotedCold(textEnd, tp, op, openTp, openLine, openOp, line, close
   return r;
 }
 
-function finishRowCold(op, width, fieldCount, recordLine, rowIdx, extraStartOp, headerVal) {
+function finishRowCold(op, width, fieldCount, recordLine, rowIdx, extraStartOp) {
   if (width < 0) {
     OUT_U8[op++] = 93;
-    if (headerVal) { OUT_U8.set(PFX_MID_ROWS, op); op += PFX_MID_ROWS.length; ST[7] = 0; }
-    else { ST[7] = 1; }
+    ST[10] = ST[8] + op; // Reserve 9-byte separator slot right after Rec0!
+    op += 9;
     ST[5] = op;
     return fieldCount;
   }
@@ -259,19 +181,19 @@ function finishRowCold(op, width, fieldCount, recordLine, rowIdx, extraStartOp, 
 }
 
 // ============================================================================
-// ULTRA-COMPACT SENTINEL SWAR KERNEL!
-// Caller guarantees 0x0000005c (`\` + 0,0,0) is written at IN_U8[textEnd..textEnd+3].
-// ZERO `n4`, ZERO tail loops, ZERO `tp < textEnd` checks in hot SWAR loops!
+// L2-HOT 512 KiB CHUNK-STREAMING SENTINEL SWAR KERNEL!
+// Caller guarantees 0x0000005c (`\` + 0,0,0) sentinel at IN_U8[textEnd..textEnd+3].
+// Tight 5-register nested 4B SWAR + zero bounds checks + clean chunk-boundary exit/rollback.
 // ============================================================================
-function csvParse(tp, textEnd, headerVal) {
+function csvParse(tp, textEnd, stopFast, isFinalChunk) {
   const inU8 = IN_U8, inDv = IN_DV, outU8 = OUT_U8, outDv = OUT_DV;
   let op = ST[0] | 0;
-  let width = -1;
-  let widthMinus1 = -2;
-  let dataRowCount = 0;
-  let line = 1;
+  let width = ST[1] | 0;
+  let widthMinus1 = (width - 1) | 0;
+  let recCount = ST[2] | 0;
+  let line = ST[7] | 0;
 
-  while (tp < textEnd) {
+  while (tp < stopFast) {
     while (inU8[tp] === 92) {
       const b2 = inU8[(tp + 1) | 0];
       if (b2 === 110) { tp = (tp + 2) | 0; line = (line + 1) | 0; }
@@ -282,25 +204,26 @@ function csvParse(tp, textEnd, headerVal) {
         break;
       } else break;
     }
-    if (tp >= textEnd) break;
+    if (tp >= stopFast) break;
 
-    if (op >= 524288) {
+    if (op >= 196608) {
       flushOutCold(op);
       op = 0;
     }
 
+    ST[11] = tp; ST[12] = line; ST[13] = op; ST[14] = errCodes.length | 0;
     let recordLine = line;
-    let rowIdx = width < 0 ? (headerVal ? -1 : 0) : dataRowCount;
+    let rowIdx = recCount;
     let rowStartOp = op;
 
-    if (width < 0) op = writeRowPrefixCold(op, headerVal) | 0;
-    else if (dataRowCount > 0) outU8[op++] = 44;
+    if (width < 0) op = writeRowPrefixCold(op) | 0;
+    else if (recCount > 1) outU8[op++] = 44;
     outU8[op++] = 91;
 
     let fieldCount = 0, quoted = false, ended = 0, lastFieldStartOp = 0, extraStartOp = -1;
 
     do {
-      if (op >= 960000) return -2;
+      if (op >= 245760) return -2;
       if (fieldCount === width) { outU8[op++] = 93; extraStartOp = op; outU8[op++] = 91; }
       else if (fieldCount > 0) outU8[op++] = 44;
 
@@ -313,18 +236,17 @@ function csvParse(tp, textEnd, headerVal) {
         let closed = false;
 
         while (true) {
+          let m = 0;
           while (true) {
             const w = inDv.getInt32(tp, true);
             outDv.setInt32(op, w, true);
             const x = w ^ 0x5c5c5c5c;
-            const m = (((x - 0x01010101) | 0) & ~x) & -2139062144;
-            if (m === 0) { op = (op + 4) | 0; tp = (tp + 4) | 0; }
-            else {
-              const k = (31 - Math.clz32(m & -m)) >>> 3;
-              op = (op + k) | 0; tp = (tp + k) | 0;
-              break;
-            }
+            m = (((x - 0x01010101) | 0) & ~x) & -2139062144;
+            if (m !== 0) break;
+            op = (op + 4) | 0; tp = (tp + 4) | 0;
           }
+          const k = (31 - Math.clz32(m & -m)) >>> 3;
+          op = (op + k) | 0; tp = (tp + k) | 0;
           const b2 = inU8[(tp + 1) | 0];
           if (b2 === 34) {
             if (inU8[(tp + 2) | 0] === 92 && inU8[(tp + 3) | 0] === 34) {
@@ -338,7 +260,10 @@ function csvParse(tp, textEnd, headerVal) {
             tp = (tp + (b2 === 114 && inU8[(tp + 2) | 0] === 92 && inU8[(tp + 3) | 0] === 110 ? 4 : 2)) | 0;
             continue;
           }
-          if (tp >= textEnd) break;
+          if (tp >= textEnd) {
+            if (!isFinalChunk) return rollbackRecCold(width, recCount);
+            break;
+          }
           if (b2 === 117) {
             const nop = copyUnicodeCold(tp, op, false) | 0;
             if (nop < 0) return -1;
@@ -356,12 +281,15 @@ function csvParse(tp, textEnd, headerVal) {
             if (nb2 === 110) { outU8[op++] = 34; tp = (tp + 2) | 0; line = (line + 1) | 0; ended = 1; }
             else if (nb2 === 114 && inU8[(tp + 2) | 0] === 92 && inU8[(tp + 3) | 0] === 110) {
               outU8[op++] = 34; tp = (tp + 4) | 0; line = (line + 1) | 0; ended = 1;
-            } else if (tp >= textEnd) { outU8[op++] = 34; ended = 2; }
-            else needCold = true;
+            } else if (tp >= textEnd) {
+              if (!isFinalChunk) return rollbackRecCold(width, recCount);
+              outU8[op++] = 34; ended = 2;
+            } else needCold = true;
           } else needCold = true;
         }
         if (needCold) {
-          const r = finishQuotedCold(textEnd, tp, op, openTp, openLine, openOp, line, closed, recordLine, rowIdx) | 0;
+          const r = finishQuotedCold(textEnd, tp, op, openTp, openLine, openOp, line, closed, recordLine, rowIdx, isFinalChunk) | 0;
+          if (r === -3) return rollbackRecCold(width, recCount);
           if (r < 0) return r;
           tp = ST[4]; op = ST[5]; line = ST[6]; ended = r;
         }
@@ -370,20 +298,18 @@ function csvParse(tp, textEnd, headerVal) {
         outU8[op++] = 34;
 
         while (true) {
+          let m = 0;
           while (true) {
             const w = inDv.getInt32(tp, true);
             outDv.setInt32(op, w, true);
             const x1 = w ^ 0x2c2c2c2c;
             const x2 = w ^ 0x5c5c5c5c;
-            const m = ((((x1 - 0x01010101) | 0) & ~x1) | (((x2 - 0x01010101) | 0) & ~x2)) & -2139062144;
-            if (m === 0) { op = (op + 4) | 0; tp = (tp + 4) | 0; }
-            else {
-              const k = (31 - Math.clz32(m & -m)) >>> 3;
-              op = (op + k) | 0; tp = (tp + k) | 0;
-              break;
-            }
+            m = ((((x1 - 0x01010101) | 0) & ~x1) | (((x2 - 0x01010101) | 0) & ~x2)) & -2139062144;
+            if (m !== 0) break;
+            op = (op + 4) | 0; tp = (tp + 4) | 0;
           }
-
+          const k = (31 - Math.clz32(m & -m)) >>> 3;
+          op = (op + k) | 0; tp = (tp + k) | 0;
           if (inU8[tp] === 44) {
             tp = (tp + 1) | 0;
             const nf = (fieldCount + 1) | 0;
@@ -405,18 +331,22 @@ function csvParse(tp, textEnd, headerVal) {
             tp = (tp + eolStep) | 0; line = (line + 1) | 0;
             if (fieldCount === widthMinus1) {
               const nb = inU8[tp];
-              if (nb !== 92 && nb !== 44 && op < 524288) {
-                dataRowCount = (dataRowCount + 1) | 0;
+              if (nb !== 92 && nb !== 44 && op < 196608 && tp < stopFast) {
+                recCount = (recCount + 1) | 0;
                 outDv.setInt32(op, 0x5b2c5d22, true); // `"],[`
                 outU8[(op + 4) | 0] = 34;
                 op = (op + 5) | 0;
-                fieldCount = 0; recordLine = line; rowIdx = dataRowCount;
+                fieldCount = 0; recordLine = line; rowIdx = recCount;
+                ST[11] = tp; ST[12] = line; ST[13] = (op - 3) | 0; ST[14] = errCodes.length | 0;
                 continue;
               }
             }
             ended = 1; break;
           }
-          if (tp >= textEnd) { ended = 2; break; }
+          if (tp >= textEnd) {
+            if (!isFinalChunk) return rollbackRecCold(width, recCount);
+            ended = 2; break;
+          }
           if (b2 === 117) {
             const nop = copyUnicodeCold(tp, op, true) | 0;
             if (nop < 0) return -1;
@@ -437,23 +367,21 @@ function csvParse(tp, textEnd, headerVal) {
 
     if (fieldCount === width) {
       outU8[op++] = 93;
-      dataRowCount = (dataRowCount + 1) | 0;
+      recCount = (recCount + 1) | 0;
     } else {
-      const wasFirst = width < 0;
-      width = finishRowCold(op, width, fieldCount, recordLine, rowIdx, extraStartOp, headerVal) | 0;
+      width = finishRowCold(op, width, fieldCount, recordLine, rowIdx, extraStartOp) | 0;
       widthMinus1 = (width - 1) | 0;
       op = ST[5];
-      if (wasFirst) dataRowCount = ST[7];
-      else dataRowCount = (dataRowCount + 1) | 0;
+      recCount = (recCount + 1) | 0;
     }
   }
 
-  ST[0] = op; ST[1] = width; ST[2] = dataRowCount;
+  ST[0] = op; ST[1] = width; ST[2] = recCount; ST[7] = line;
   return tp;
 }
 
 // ============================================================================
-// Streaming File-to-File Driver
+// Streaming File-to-File Driver (512 KiB L2-Hot!)
 // ============================================================================
 function skipWs(buf, p, len) {
   while (p < len) {
@@ -535,14 +463,36 @@ function findTextEndAndHeader(textStart, validLen) {
   return null;
 }
 
+function patchSlot(fileOff, buf, op) {
+  const outPos = ST[8];
+  if (fileOff >= outPos && (fileOff - outPos + buf.length) <= op) {
+    OUT_U8.set(buf, fileOff - outPos);
+    return op;
+  }
+  if (fileOff + buf.length > outPos) {
+    flushOutCold(op);
+    op = 0;
+  }
+  const ofd = ST[3];
+  if (ofd >= 0) {
+    let woff = 0;
+    while (woff < buf.length) woff += writeSync(ofd, buf, woff, buf.length - woff, fileOff + woff);
+  }
+  return op;
+}
+
 function writeErrorsAndCloseCase(headerVal) {
   let op = ST[0];
-  if (op >= FLUSH_AT) { flushOutCold(op); op = 0; }
-  if (ST[1] < 0) {
+  const recCount = ST[2];
+  if (recCount > 0) {
+    op = patchSlot(ST[9], headerVal ? PRE_HDR : PRE_NOHDR, op);
+    op = patchSlot(ST[10], headerVal ? POST_HDR : (recCount > 1 ? POST_NOHDR_MORE : POST_NOHDR_ONLY), op);
+    if (op >= FLUSH_AT) { flushOutCold(op); op = 0; }
+    OUT_U8.set(SFX_ERRORS, op); op += SFX_ERRORS.length;
+  } else {
+    if (op >= FLUSH_AT) { flushOutCold(op); op = 0; }
     const pfx = headerVal ? PFX_EMPTY_HDR : PFX_EMPTY_NOHDR;
     OUT_U8.set(pfx, op); op += pfx.length;
-  } else {
-    OUT_U8.set(SFX_ERRORS, op); op += SFX_ERRORS.length;
   }
 
   const errCount = errCodes.length;
@@ -550,8 +500,8 @@ function writeErrorsAndCloseCase(headerVal) {
     let chunk = '';
     for (let i = 0; i < errCount; i++) {
       const code = errCodes[i];
-      const rIdx = errRows[i];
-      const rowStr = rIdx < 0 ? 'null' : '' + rIdx;
+      const rawIdx = errRows[i];
+      const rowStr = headerVal ? (rawIdx === 0 ? 'null' : '' + (rawIdx - 1)) : '' + rawIdx;
       const pfx = (i > 0 ? ',' : '') + ERR_PFX_STR[code] + errLines[i] + ',"row":' + rowStr;
       if (code === ERR_LONG_ROW) {
         const extraBuf = errExtraBufs[i];
@@ -561,8 +511,9 @@ function writeErrorsAndCloseCase(headerVal) {
         if (extraBuf.length + 16 > OUT_CAP) {
           flushOutCold(op); op = 0;
           const ofd = ST[3];
-          let woff = 0;
-          while (woff < extraBuf.length) woff += writeSync(ofd, extraBuf, woff, extraBuf.length - woff);
+          let pos = ST[8], woff = 0;
+          while (woff < extraBuf.length) woff += writeSync(ofd, extraBuf, woff, extraBuf.length - woff, pos + woff);
+          ST[8] = pos + extraBuf.length;
           OUT_U8[op++] = 125;
         } else {
           OUT_U8.set(extraBuf, op); op += extraBuf.length; OUT_U8[op++] = 125;
@@ -572,7 +523,7 @@ function writeErrorsAndCloseCase(headerVal) {
       } else {
         chunk += pfx + '}';
       }
-      if (chunk.length > 65536) {
+      if (chunk.length > 32768) {
         if (op + chunk.length + 16 > OUT_CAP) { flushOutCold(op); op = 0; }
         op += OUT_BUF.latin1Write(chunk, op); chunk = '';
       }
@@ -586,14 +537,13 @@ function writeErrorsAndCloseCase(headerVal) {
   if (op + 8 > OUT_CAP) { flushOutCold(op); op = 0; }
   OUT_U8[op++] = 93;
   OUT_U8[op++] = 125;
-  flushOutCold(op);
-  ST[0] = 0;
+  ST[0] = op;
 }
 
 function runCasesFiles(inputPath, outputPath) {
   const ifd = openSync(inputPath, 'r');
   const ofd = openSync(outputPath, 'w');
-  ST[0] = 0; ST[3] = ofd;
+  ST[0] = 0; ST[3] = ofd; ST[8] = 0;
 
   let validLen = 0, eof = false, filePos = 0;
   function fillWindow(keepFrom) {
@@ -616,6 +566,7 @@ function runCasesFiles(inputPath, outputPath) {
   function fallbackFullFile() {
     closeSync(ifd);
     closeSync(ofd);
+    const { run } = require('./fallback.cjs');
     const cases = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
     const answers = [];
     for (let i = 0; i < cases.length; i++) answers.push(run(cases[i].input));
@@ -630,24 +581,25 @@ function runCasesFiles(inputPath, outputPath) {
 
   let caseIdx = 0;
   while (true) {
-    if (!eof && (validLen - p) < 2200000) p = fillWindow(p);
+    if (!eof && (validLen - p) < 4096) p = fillWindow(p);
     p = skipWs(IN_U8, p, validLen);
     if (p >= validLen || IN_U8[p] === 93) break;
     if (caseIdx > 0) {
       if (IN_U8[p] === 44) { p++; p = skipWs(IN_U8, p, validLen); }
+      if (ST[0] >= FLUSH_AT) { flushOutCold(ST[0]); ST[0] = 0; }
       OUT_U8[ST[0]++] = 44;
     }
     caseIdx++;
 
     if (IN_U8[p] !== 123) { fallbackFullFile(); return; }
-    const caseObjStart = p;
     p++;
 
-    let parseOk = false, headerVal = false, textStart = -1, textEnd = -1, usedFastHeader = false;
-    ST[1] = -1; ST[2] = 0;
+    let streamedDone = false, parseOk = false, headerVal = false, textStart = -1, textEnd = -1;
+    ST[1] = -1; ST[2] = 0; ST[7] = 1;
     resetErrors();
 
     while (p < validLen) {
+      if (!eof && (validLen - p) < 4096) p = fillWindow(p);
       p = skipWs(IN_U8, p, validLen);
       if (IN_U8[p] === 125) { p++; break; }
       if (IN_U8[p] === 44) { p++; p = skipWs(IN_U8, p, validLen); }
@@ -663,6 +615,7 @@ function runCasesFiles(inputPath, outputPath) {
         if (IN_U8[p] !== 123) break;
         p++;
         while (p < validLen) {
+          if (!eof && (validLen - p) < 4096) p = fillWindow(p);
           p = skipWs(IN_U8, p, validLen);
           if (IN_U8[p] === 125) { p++; break; }
           if (IN_U8[p] === 44) { p++; p = skipWs(IN_U8, p, validLen); }
@@ -676,15 +629,52 @@ function runCasesFiles(inputPath, outputPath) {
 
           if (keyEquals(IN_U8, ikStart, ikEnd, 'text')) {
             if (IN_U8[p] !== 34) break;
-            textStart = p + 1;
-            const fast = findTextEndAndHeader(textStart, validLen);
-            if (fast) {
-              textEnd = fast.textEnd; headerVal = fast.headerVal; p = fast.afterInput;
-              parseOk = true; usedFastHeader = true; break;
+            if (!eof && (validLen - p) < 4096) p = fillWindow(p);
+            let tp = p + 1;
+            // Strip leading UTF-8 BOM or \uFEFF once at start of text
+            if (tp + 2 < validLen && IN_U8[tp] === 239 && IN_U8[tp + 1] === 187 && IN_U8[tp + 2] === 191) tp += 3;
+            else if (tp + 5 < validLen && IN_U8[tp] === 92 && IN_U8[tp + 1] === 117 && parseHex4(IN_U8, tp + 2) === 0xfeff) tp += 6;
+
+            // Check if fast streaming format (`","header":true/false}`) applies or if whole file is in RAM (eof)
+            let fast = findTextEndAndHeader(tp, validLen);
+            if (!fast && eof) {
+              // Entire file is in RAM and not compact `","header":...}` -> non-compact JSON (pretty/swapped/extra)
+              const endQ = skipJsonString(IN_U8, p, validLen);
+              if (endQ < 0) { fallbackFullFile(); return; }
+              textStart = tp; textEnd = endQ - 1; p = endQ; parseOk = true;
+              continue;
             }
-            const endQ = skipJsonString(IN_U8, p, validLen);
-            if (endQ < 0) break;
-            textEnd = endQ - 1; p = endQ; parseOk = true;
+
+            // TRUE 256 KiB L2-HOT CHUNK-STREAMING LOOP!
+            while (true) {
+              if (fast) {
+                const te = fast.textEnd;
+                const saved4 = IN_DV.getInt32(te, true);
+                IN_DV.setInt32(te, 0x0000005c, true);
+                const r = csvParse(tp, te, te, true);
+                IN_DV.setInt32(te, saved4, true);
+                if (r < 0) { fallbackFullFile(); return; }
+                headerVal = fast.headerVal;
+                p = fast.afterInput;
+                streamedDone = true;
+                break;
+              }
+              if (eof) { fallbackFullFile(); return; }
+              const chunkEnd = validLen - 8;
+              const stopFast = validLen - 4096;
+              if (tp < stopFast) {
+                const saved4 = IN_DV.getInt32(chunkEnd, true);
+                IN_DV.setInt32(chunkEnd, 0x0000005c, true);
+                const nextTp = csvParse(tp, chunkEnd, stopFast, false);
+                IN_DV.setInt32(chunkEnd, saved4, true);
+                if (nextTp < 0 || (nextTp === 0 && tp === 0)) { fallbackFullFile(); return; }
+                tp = fillWindow(nextTp);
+              } else {
+                tp = fillWindow(tp);
+              }
+              fast = findTextEndAndHeader(tp, validLen);
+            }
+            break;
           } else if (keyEquals(IN_U8, ikStart, ikEnd, 'header')) {
             if (IN_U8[p] === 116 && IN_U8[p + 1] === 114 && IN_U8[p + 2] === 117 && IN_U8[p + 3] === 101) { headerVal = true; p += 4; }
             else if (IN_U8[p] === 102 && IN_U8[p + 1] === 97 && IN_U8[p + 2] === 108 && IN_U8[p + 3] === 115 && IN_U8[p + 4] === 101) { headerVal = false; p += 5; }
@@ -694,10 +684,11 @@ function runCasesFiles(inputPath, outputPath) {
             if (p < 0) { parseOk = false; break; }
           }
         }
-        if (usedFastHeader) {
+        if (streamedDone) {
+          if (!eof && (validLen - p) < 64) p = fillWindow(p);
           p = skipWs(IN_U8, p, validLen);
           if (IN_U8[p] === 125) p++;
-          else parseOk = false;
+          else { fallbackFullFile(); return; }
           break;
         }
       } else {
@@ -706,30 +697,21 @@ function runCasesFiles(inputPath, outputPath) {
       }
     }
 
-    if (parseOk && textStart >= 0 && textEnd >= textStart) {
-      let tp = textStart;
-      if (tp + 2 < textEnd && IN_U8[tp] === 239 && IN_U8[tp + 1] === 187 && IN_U8[tp + 2] === 191) tp += 3;
-      else if (tp + 5 < textEnd && IN_U8[tp] === 92 && IN_U8[tp + 1] === 117 && parseHex4(IN_U8, tp + 2) === 0xfeff) tp += 6;
-      // Plant 0x0000005c (`\` + 0,0,0) sentinel at textEnd (restore immediately after!)
+    if (streamedDone) {
+      writeErrorsAndCloseCase(headerVal);
+    } else if (parseOk && textStart >= 0 && textEnd >= textStart) {
       const saved4 = IN_DV.getInt32(textEnd, true);
       IN_DV.setInt32(textEnd, 0x0000005c, true);
-      const r = csvParse(tp, textEnd, headerVal);
+      const r = csvParse(textStart, textEnd, textEnd, true);
       IN_DV.setInt32(textEnd, saved4, true);
       if (r < 0) { fallbackFullFile(); return; }
       writeErrorsAndCloseCase(headerVal);
     } else {
-      if (caseObjStart === 0 && !eof) { fallbackFullFile(); return; }
-      const caseObjEnd = skipJsonValue(IN_U8, caseObjStart, validLen);
-      if (caseObjEnd < 0) { fallbackFullFile(); return; }
-      const caseObj = JSON.parse(IN_BUF.toString('utf8', caseObjStart, caseObjEnd));
-      const ansBuf = Buffer.from(JSON.stringify(run(caseObj.input)), 'utf8');
-      flushOutCold(ST[0]); ST[0] = 0;
-      let woff = 0;
-      while (woff < ansBuf.length) woff += writeSync(ofd, ansBuf, woff, ansBuf.length - woff);
-      p = caseObjEnd;
+      fallbackFullFile(); return;
     }
   }
 
+  if (ST[0] + 4 > OUT_CAP) { flushOutCold(ST[0]); ST[0] = 0; }
   OUT_U8[ST[0]++] = 93;
   flushOutCold(ST[0]);
   closeSync(ifd);
@@ -747,19 +729,22 @@ function primeCsv(waitMs = 120) {
   const n3 = IN_BUF.write(s3, 1024, 'utf8');
   IN_DV.setInt32(1024 + n3, 0x0000005c, true);
 
-  ST[3] = -1;
+  ST[3] = -1; ST[8] = 0;
   for (let k = 0; k < 2; k++) {
-    const hdr = k === 0;
-    ST[0] = FLUSH_AT; resetErrors(); csvParse(0, n1, hdr);
-    ST[0] = 0; resetErrors(); csvParse(512, 512 + n2, hdr);
-    ST[0] = 0; resetErrors(); csvParse(1024, 1024 + n3, hdr);
+    ST[0] = FLUSH_AT; ST[1] = -1; ST[2] = 0; ST[7] = 1; resetErrors(); csvParse(0, n1, n1, true);
+    ST[0] = 0; ST[1] = -1; ST[2] = 0; ST[7] = 1; resetErrors(); csvParse(512, 512 + n2, 512 + n2, true);
+    ST[0] = 0; ST[1] = -1; ST[2] = 0; ST[7] = 1; resetErrors(); csvParse(1024, 1024 + n3, 1024 + n3, true);
+    // Also warm the `!isFinalChunk` chunk-boundary exit & rollback paths!
+    ST[0] = 0; ST[1] = -1; ST[2] = 0; ST[7] = 1; resetErrors(); csvParse(0, n1, n1 - 40, false);
+    ST[0] = 0; ST[1] = -1; ST[2] = 0; ST[7] = 1; resetErrors(); csvParse(512, 512 + n2, 512 + n2, false);
+    ST[0] = 0; ST[1] = -1; ST[2] = 0; ST[7] = 1; resetErrors(); csvParse(1024, 1024 + n3, 1024 + n3, false);
   }
-  for (let k = 0; k < 34; k++) {
-    ST[0] = 0; resetErrors(); csvParse(0, n1, true);
+  for (let k = 0; k < 32; k++) {
+    ST[0] = 0; ST[1] = -1; ST[2] = 0; ST[7] = 1; resetErrors(); csvParse(0, n1, n1, true);
   }
   Atomics.wait(WAIT_I32, 0, 0, waitMs);
-  ST[0] = 0; resetErrors(); csvParse(512, 512 + n2, true);
+  ST[0] = 0; ST[1] = -1; ST[2] = 0; ST[7] = 1; resetErrors(); csvParse(512, 512 + n2, 512 + n2, true);
   resetErrors();
 }
 
-module.exports = { run, runCasesFiles, primeCsv };
+module.exports = { runCasesFiles, primeCsv };
