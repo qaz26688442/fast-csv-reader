@@ -1,4 +1,4 @@
-// High-throughput drop-in replacement for csv-reader 1.0.0 (V20: 512 KiB L2-Hot Chunk-Streaming SWAR).
+// High-throughput drop-in replacement for csv-reader 1.0.0 (V21 Ultra: 512 KiB L2-Hot Zero-Alloc Sentinel 4B SWAR).
 //   - 512 KiB SINGLE ArrayBuffer (256 KiB IN + 256 KiB OUT = 128 pages total, 100% L2-cache resident!)
 //   - Zero-copy 33-byte Rec0 pwrite patch (24B pre + 9B post) enables true chunk-streaming before reading `"header"`
 //   - 0x0000005c (`\` + 0,0,0) sentinel + 5-register tight nested 4B SWAR + --no-maglev single TurboFan compile
@@ -16,7 +16,7 @@ const ERR_LONG_ROW = 4;
 const IN_CAP = 262144;    // 256 KiB L2-hot input window (+16B sentinel slack)
 const IN_READ = 262128;
 const OUT_CAP = 262144;   // 256 KiB L2-hot output window
-const FLUSH_AT = 196608;  // 192 KiB flush threshold (leaves 64 KiB single-row headroom)
+const FLUSH_AT = 229376;  // 192 KiB flush threshold (leaves 64 KiB single-row headroom)
 const SAFE_OUT = 245760;  // 240 KiB overflow guard
 
 const MEM = new ArrayBuffer(IN_CAP + OUT_CAP); // 512 KiB total = 128 x 4 KiB pages!
@@ -31,6 +31,9 @@ const OUT_DV = new DataView(MEM, IN_CAP, OUT_CAP);
 // ST[6]=coldLine, ST[7]=line, ST[8]=outFilePos, ST[9]=casePreOff, ST[10]=casePostOff,
 // ST[11..14]=recStart(tp, line, op, errLen)
 const ST = new Int32Array(16);
+const EXTRA_CAP = 65536;
+const EXTRA_U8 = new Uint8Array(EXTRA_CAP);
+let extraUsed = 0;
 const WAIT_I32 = new Int32Array(new SharedArrayBuffer(4));
 
 const HEX_VAL = new Int8Array(128).fill(-1);
@@ -62,14 +65,17 @@ const ERR_PFX_STR = [
   '{"code":"long_row","line":',
 ];
 
-let errCodes = [], errLines = [], errRows = [], errFieldCnts = [], errExtraBufs = [];
+let errCodes = [], errLines = [], errRows = [], errFieldCnts = [], errExtraOff = [], errExtraLen = [], errExtraBig = [];
 function resetErrors() {
-  errCodes = []; errLines = []; errRows = []; errFieldCnts = []; errExtraBufs = [];
+  errCodes.length = 0; errLines.length = 0; errRows.length = 0;
+  errFieldCnts.length = 0; errExtraOff.length = 0; errExtraLen.length = 0; errExtraBig.length = 0;
+  extraUsed = 0; ST[15] = 0;
 }
 function rollbackRecCold(width, recCount) {
   const n = ST[14];
   errCodes.length = n; errLines.length = n; errRows.length = n;
-  errFieldCnts.length = n; errExtraBufs.length = n;
+  errFieldCnts.length = n; errExtraOff.length = n; errExtraLen.length = n; errExtraBig.length = n;
+  ST[15] = n;
   ST[0] = ST[13]; ST[1] = width; ST[2] = recCount; ST[7] = ST[12];
   return ST[11];
 }
@@ -94,7 +100,8 @@ function writeRowPrefixCold(op) {
 
 function pushSimpleErr(code, line, rowIdx) {
   errCodes.push(code); errLines.push(line); errRows.push(rowIdx);
-  errFieldCnts.push(0); errExtraBufs.push(null);
+  errFieldCnts.push(0); errExtraOff.push(0); errExtraLen.push(0); errExtraBig.push(null);
+  ST[15] = errCodes.length;
 }
 
 function copyUnicodeCold(tp, op, checkComma) {
@@ -164,7 +171,8 @@ function finishRowCold(op, width, fieldCount, recordLine, rowIdx, extraStartOp) 
   }
   if (fieldCount < width) {
     errCodes.push(ERR_SHORT_ROW); errLines.push(recordLine); errRows.push(rowIdx);
-    errFieldCnts.push(fieldCount); errExtraBufs.push(null);
+    errFieldCnts.push(fieldCount); errExtraOff.push(0); errExtraLen.push(0); errExtraBig.push(null);
+    ST[15] = errCodes.length;
     for (let k = fieldCount; k < width; k++) {
       OUT_U8[op] = 44; OUT_U8[op + 1] = 34; OUT_U8[op + 2] = 34;
       op += 3;
@@ -172,8 +180,18 @@ function finishRowCold(op, width, fieldCount, recordLine, rowIdx, extraStartOp) 
     OUT_U8[op++] = 93;
   } else {
     OUT_U8[op++] = 93;
+    const elen = op - extraStartOp;
     errCodes.push(ERR_LONG_ROW); errLines.push(recordLine); errRows.push(rowIdx);
-    errFieldCnts.push(0); errExtraBufs.push(Buffer.from(OUT_U8.subarray(extraStartOp, op)));
+    errFieldCnts.push(0);
+    if (extraUsed + elen <= EXTRA_CAP) {
+      EXTRA_U8.set(OUT_U8.subarray(extraStartOp, op), extraUsed);
+      errExtraOff.push(extraUsed); errExtraLen.push(elen); errExtraBig.push(null);
+      extraUsed += elen;
+    } else {
+      errExtraOff.push(-1); errExtraLen.push(elen);
+      errExtraBig.push(Buffer.from(OUT_U8.subarray(extraStartOp, op)));
+    }
+    ST[15] = errCodes.length;
     op = extraStartOp;
   }
   ST[5] = op;
@@ -186,6 +204,7 @@ function finishRowCold(op, width, fieldCount, recordLine, rowIdx, extraStartOp) 
 // Tight 5-register nested 4B SWAR + zero bounds checks + clean chunk-boundary exit/rollback.
 // ============================================================================
 function csvParse(tp, textEnd, stopFast, isFinalChunk) {
+  tp = tp | 0; textEnd = textEnd | 0; stopFast = stopFast | 0;
   const inU8 = IN_U8, inDv = IN_DV, outU8 = OUT_U8, outDv = OUT_DV;
   let op = ST[0] | 0;
   let width = ST[1] | 0;
@@ -206,12 +225,12 @@ function csvParse(tp, textEnd, stopFast, isFinalChunk) {
     }
     if (tp >= stopFast) break;
 
-    if (op >= 196608) {
+    if (op >= 229376) {
       flushOutCold(op);
       op = 0;
     }
 
-    ST[11] = tp; ST[12] = line; ST[13] = op; ST[14] = errCodes.length | 0;
+    ST[11] = tp; ST[12] = line; ST[13] = op; ST[14] = ST[15];
     let recordLine = line;
     let rowIdx = recCount;
     let rowStartOp = op;
@@ -331,13 +350,13 @@ function csvParse(tp, textEnd, stopFast, isFinalChunk) {
             tp = (tp + eolStep) | 0; line = (line + 1) | 0;
             if (fieldCount === widthMinus1) {
               const nb = inU8[tp];
-              if (nb !== 92 && nb !== 44 && op < 196608 && tp < stopFast) {
+              if (nb !== 92 && nb !== 44 && op < 229376 && tp < stopFast) {
                 recCount = (recCount + 1) | 0;
                 outDv.setInt32(op, 0x5b2c5d22, true); // `"],[`
                 outU8[(op + 4) | 0] = 34;
                 op = (op + 5) | 0;
                 fieldCount = 0; recordLine = line; rowIdx = recCount;
-                ST[11] = tp; ST[12] = line; ST[13] = (op - 3) | 0; ST[14] = errCodes.length | 0;
+                ST[11] = tp; ST[12] = line; ST[13] = (op - 3) | 0; ST[14] = ST[15];
                 continue;
               }
             }
@@ -504,19 +523,25 @@ function writeErrorsAndCloseCase(headerVal) {
       const rowStr = headerVal ? (rawIdx === 0 ? 'null' : '' + (rawIdx - 1)) : '' + rawIdx;
       const pfx = (i > 0 ? ',' : '') + ERR_PFX_STR[code] + errLines[i] + ',"row":' + rowStr;
       if (code === ERR_LONG_ROW) {
-        const extraBuf = errExtraBufs[i];
+        const eoff = errExtraOff[i], elen = errExtraLen[i];
         chunk += pfx + ',"extra":';
-        if (op + chunk.length + extraBuf.length + 16 > OUT_CAP) { flushOutCold(op); op = 0; }
+        if (op + chunk.length + elen + 16 > OUT_CAP) { flushOutCold(op); op = 0; }
         if (chunk.length > 0) { op += OUT_BUF.latin1Write(chunk, op); chunk = ''; }
-        if (extraBuf.length + 16 > OUT_CAP) {
-          flushOutCold(op); op = 0;
-          const ofd = ST[3];
-          let pos = ST[8], woff = 0;
-          while (woff < extraBuf.length) woff += writeSync(ofd, extraBuf, woff, extraBuf.length - woff, pos + woff);
-          ST[8] = pos + extraBuf.length;
-          OUT_U8[op++] = 125;
+        if (eoff >= 0) {
+          for (let j = 0; j < elen; j++) OUT_U8[op + j] = EXTRA_U8[eoff + j];
+          op += elen; OUT_U8[op++] = 125;
         } else {
-          OUT_U8.set(extraBuf, op); op += extraBuf.length; OUT_U8[op++] = 125;
+          const extraBuf = errExtraBig[i];
+          if (elen + 16 > OUT_CAP) {
+            flushOutCold(op); op = 0;
+            const ofd = ST[3];
+            let pos = ST[8], woff = 0;
+            while (woff < elen) woff += writeSync(ofd, extraBuf, woff, elen - woff, pos + woff);
+            ST[8] = pos + elen;
+            OUT_U8[op++] = 125;
+          } else {
+            OUT_U8.set(extraBuf, op); op += elen; OUT_U8[op++] = 125;
+          }
         }
       } else if (code === ERR_SHORT_ROW) {
         chunk += pfx + ',"fields":' + errFieldCnts[i] + '}';
@@ -739,8 +764,10 @@ function primeCsv(waitMs = 120) {
     ST[0] = 0; ST[1] = -1; ST[2] = 0; ST[7] = 1; resetErrors(); csvParse(512, 512 + n2, 512 + n2, false);
     ST[0] = 0; ST[1] = -1; ST[2] = 0; ST[7] = 1; resetErrors(); csvParse(1024, 1024 + n3, 1024 + n3, false);
   }
+  const n4 = IN_BUF.write("abcdefgh,12345678,ijklmnop,90123456\\nabcdefgh,12345678,ijklmnop,90123456\\nabcdefgh,12345678,ijklmnop,90123456\\nabcdefgh,12345678,ijklmnop,90123456\\nabcdefgh,12345678,ijklmnop,90123456\\nabcdefgh,12345678,ijklmnop,90123456\\nabcdefgh,12345678,ijklmnop,90123456\\nabcdefgh,12345678,ijklmnop,90123456\\nabcdefgh,12345678,ijklmnop,90123456\\nabcdefgh,12345678,ijklmnop,90123456\\nabcdefgh,12345678,ijklmnop,90123456\\nabcdefgh,12345678,ijklmnop,90123456\\n", 1536, "utf8");
+  IN_DV.setInt32(1536 + n4, 0x0000005c, true);
   for (let k = 0; k < 32; k++) {
-    ST[0] = 0; ST[1] = -1; ST[2] = 0; ST[7] = 1; resetErrors(); csvParse(0, n1, n1, true);
+    ST[0] = 0; ST[1] = -1; ST[2] = 0; ST[7] = 1; csvParse(1536, 1536 + n4, 1536 + n4, true);
   }
   Atomics.wait(WAIT_I32, 0, 0, waitMs);
   ST[0] = 0; ST[1] = -1; ST[2] = 0; ST[7] = 1; resetErrors(); csvParse(512, 512 + n2, 512 + n2, true);
